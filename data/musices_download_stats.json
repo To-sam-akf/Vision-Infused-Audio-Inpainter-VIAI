@@ -1,0 +1,26 @@
+{
+  "record_count": 1,
+  "estimated_record_count": 0,
+  "unknown_record_count": 1,
+  "estimated_total_bytes": 0,
+  "estimated_total_human": "0 B",
+  "by_instrument": {
+    "accordion": {
+      "record_count": 1,
+      "estimated_record_count": 0,
+      "unknown_record_count": 1,
+      "estimated_total_bytes": 0
+    }
+  },
+  "records": [
+    {
+      "instrument": "accordion",
+      "youtube_id": "iB17xqmFw3A",
+      "sample_key": "accordion/iB17xqmFw3A",
+      "status": "error",
+      "estimated_total_bytes": null,
+      "url": "https://www.youtube.com/watch?v=iB17xqmFw3A",
+      "error_message": "ERROR: [youtube] iB17xqmFw3A: Sign in to confirm you\u2019re not a bot. Use --cookies-from-browser or --cookies for the authentication. See  https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp  for how to manually pass cookies. Also see  https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies  for tips on effectively exporting YouTube cookies"
+    }
+  ]
+}

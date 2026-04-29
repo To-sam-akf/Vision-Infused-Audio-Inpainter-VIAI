@@ -52,7 +52,7 @@ class _NPYDataSource(FileDataSource):
         self.col = col
         self.lengths = []
         self.speaker_id = speaker_id
-        self.multi_speaker = True
+        self.multi_speaker = False
         self.speaker_ids = None
         self.train = train
         self.test_size = test_size
@@ -70,6 +70,7 @@ class _NPYDataSource(FileDataSource):
             lines = f.readlines()
         l = lines[0].decode("utf-8").split("|")
         assert len(l) == 4 or len(l) == 5
+        self.multi_speaker = len(l) == 5
         self.lengths = list(
             map(lambda l: int(l.decode("utf-8").split("|")[-1]) * 1280, lines))
 
@@ -117,7 +118,7 @@ class ImageDataSource(FileDataSource):
         self.col = col
         self.lengths = []
         self.speaker_id = speaker_id
-        self.multi_speaker = True
+        self.multi_speaker = False
         self.speaker_ids = None
         self.train = train
         self.test_size = test_size
@@ -134,6 +135,7 @@ class ImageDataSource(FileDataSource):
             lines = f.readlines()
         l = lines[0].decode("utf-8").split("|")
         assert len(l) == 4 or len(l) == 5
+        self.multi_speaker = len(l) == 5
         self.lengths = list(
             map(lambda l: int(l.decode("utf-8").split("|")[-1]), lines))
 
@@ -580,4 +582,3 @@ def get_data_loaders(data_root, speaker_id=None, test_shuffle=True):
         data_loaders[phase] = data_loader
 
     return data_loaders
-

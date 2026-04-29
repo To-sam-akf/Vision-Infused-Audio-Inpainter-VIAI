@@ -3,7 +3,6 @@ import math
 import torch
 import torch.utils.model_zoo as model_zoo
 import cv2
-from Data_loaders import AV_loader
 from Options_inpainting import Inpainting_Config
 from utils import util
 from networks.ResNet import BasicBlock, Bottleneck

@@ -1,0 +1,2 @@
+sample_key,status,output_path,downloaded_bytes,estimated_total_bytes,error_message
+accordion/iB17xqmFw3A,error,data/raw_videos/accordion/iB17xqmFw3A.mp4,0,,yt-dlp exited with code 1

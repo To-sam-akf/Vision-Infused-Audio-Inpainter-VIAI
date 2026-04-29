@@ -296,6 +296,5 @@ def resave_data():
                 print('finish processing {}'.format(file_folder_path))
 
 
-resave_data()
-# image = cv2.imread("/home/hzhou/Documents/AV-generation/MUSIC_dataset/data/cello/data/0054_0001/image_crop/5.jpg")
-# print(np.shape(image))
+if __name__ == "__main__":
+    resave_data()
