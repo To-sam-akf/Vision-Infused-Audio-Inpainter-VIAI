@@ -7,7 +7,14 @@ requires-python = ">=3.10"
 dependencies = [
     "imageio-ffmpeg",
     "librosa",
+    "nnmnkwii",
     "numpy",
-    "opencv-python",
+    "opencv-contrib-python",
+    "tensorboardX",
     "yt-dlp[default]",
+]
+
+[project.optional-dependencies]
+local-cuda = [
+    "torch",
 ]

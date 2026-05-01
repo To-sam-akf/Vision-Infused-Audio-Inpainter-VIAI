@@ -30,7 +30,10 @@ class AudioModel(object):
         self.netD = Discriminator_Networks.MelDiscriminator().to(self.device)
 
         self.criterion_gan = GANLoss(use_lsgan=False, device=self.device)
-        self.criterion_sync = L2ContrastiveLoss(margin=0.0, max_violation=False)
+        self.criterion_sync = L2ContrastiveLoss(
+            margin=getattr(hparams, "sync_margin", 1.0),
+            max_violation=False,
+        )
         self.criterion_l1 = nn.L1Loss()
 
         generator_params = list(self.Mel_Encoder.parameters()) + list(self.Mel_Decoder.parameters())
@@ -162,7 +165,7 @@ class AudioModel(object):
                 getattr(self.hparams, "sync_decay_interval", 1000.0),
                 getattr(self.hparams, "sync_decay_floor", 0.1),
             )
-            self.EmbeddingL2 = eta2 * self.criterion_sync(self.mel_net_norm, self.video_net_norm)
+            self.EmbeddingL2 = eta2 * self.criterion_sync(self.mel_net_norm.detach(), self.video_net_norm)
         else:
             self.EmbeddingL2 = torch.zeros(1, device=self.device, dtype=self.loss_mel_L1.dtype).squeeze(0)
 
@@ -280,4 +283,3 @@ class AudioModel(object):
     def del_no_need(self):
         # Kept for compatibility with original training loop.
         return
-

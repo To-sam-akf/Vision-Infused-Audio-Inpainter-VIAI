@@ -55,11 +55,18 @@ class BaseOptions(object):
         self.parser.add_argument("--checkpoint_interval", type=int, default=1000)
         self.parser.add_argument("--train_eval_interval", type=int, default=1000)
         self.parser.add_argument("--test_eval_epoch_interval", type=int, default=1)
+        self.parser.add_argument(
+            "--max_train_steps",
+            type=int,
+            default=None,
+            help="Stop after this many optimizer steps. Intended for local smoke tests only.",
+        )
 
         # Loss weights (paper-style objective)
         self.parser.add_argument("--lambda_recon", type=float, default=1.0)
         self.parser.add_argument("--beta_gan", type=float, default=0.1)
         self.parser.add_argument("--lambda_sync", type=float, default=1.0)
+        self.parser.add_argument("--sync_margin", type=float, default=1.0)
         self.parser.add_argument("--recon_decay_base", type=float, default=0.9)
         self.parser.add_argument("--recon_decay_interval", type=float, default=1000.0)
         self.parser.add_argument("--recon_decay_floor", type=float, default=0.1)

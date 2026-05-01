@@ -9,3 +9,11 @@ __pycache__/
 *.jpg
 .idea
 .pth
+
+# Video data
+data/raw_videos/
+
+# Python virtual environment
+venv/
+.venv/
+

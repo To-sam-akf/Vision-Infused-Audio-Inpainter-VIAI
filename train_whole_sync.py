@@ -33,6 +33,7 @@ def train_loop(model, data_loaders, writer, checkpoint_dir=None):
 
     global global_step, global_epoch, global_test_step
     count = 0
+    stop_training = False
     while global_epoch < hparams.nepochs:
         for phase, data_loader in data_loaders.items():
             train = (phase == "train")
@@ -75,6 +76,8 @@ def train_loop(model, data_loaders, writer, checkpoint_dir=None):
                     model.train = 1
                     model.optimize_parameters(global_step)
                     global_step += 1
+                    if hparams.max_train_steps is not None and global_step >= hparams.max_train_steps:
+                        stop_training = True
                 else:
                     model.train = 0
                     with torch.no_grad():
@@ -110,6 +113,9 @@ def train_loop(model, data_loaders, writer, checkpoint_dir=None):
                 EmbeddingL2_loss += model.EmbeddingL2_item
                 mel_running_loss += model.loss_mel_L1_item
                 model.del_no_need()
+                if stop_training:
+                    print("Reached local smoke-test max_train_steps={}".format(hparams.max_train_steps))
+                    break
             # log per epoch
             averaged_loss = running_loss / len(data_loader)
             averaged_EmbeddingL2_loss = EmbeddingL2_loss / len(data_loader)
@@ -141,8 +147,12 @@ def train_loop(model, data_loaders, writer, checkpoint_dir=None):
                 info_inv = 'Audio Retrieval ({} samples): R@1: {:.2f}, R@5: {:.2f}, R@10: {:.2f}, R@50: {:.2f}, MedR: {:.1f}, MeanR: {:.1f}'
                 print(info.format(audio_ebds.shape[0], *metrics))
                 print(info_inv.format(image_ebds.shape[0], *metrics_inv))
+            if stop_training:
+                break
         global_epoch += 1
         print("current_lr {}".format(model.current_lr))
+        if stop_training:
+            break
 
 
 if __name__ == "__main__":
@@ -185,4 +195,3 @@ if __name__ == "__main__":
     print("Finished")
 
     sys.exit(0)
-

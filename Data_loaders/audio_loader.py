@@ -9,7 +9,6 @@ from nnmnkwii.datasets import FileSourceDataset, FileDataSource
 from torch.utils import data as data_utils
 import glob
 from sklearn.model_selection import train_test_split
-from keras.utils import np_utils
 import cv2
 from wavenet_vocoder.util import is_mulaw_quantize, is_mulaw, is_raw, is_scalar_input
 import numpy as np
@@ -30,6 +29,13 @@ def _pad_2d(x, max_len, b_pad=0):
     x = np.pad(x, [(b_pad, max_len - len(x) - b_pad), (0, 0)],
                mode="constant", constant_values=0)
     return x
+
+
+def to_categorical(values, num_classes):
+    values = np.asarray(values, dtype=np.int64)
+    categorical = np.zeros((values.size, num_classes), dtype=np.float32)
+    categorical[np.arange(values.size), values] = 1.0
+    return categorical
 
 
 def ensure_divisible(length, divisible_by=256, lower=True):
@@ -486,9 +492,10 @@ def collate_fn(batch):
     # (B, T, C)
     # pad for time-axis
     if is_mulaw_quantize(hparams.input_type):
-        x_batch = np.array([_pad_2d(np_utils.to_categorical(
-            x[0], num_classes=hparams.quantize_channels),
-            max_input_len) for x in batch], dtype=np.float32)
+        x_batch = np.array([
+            _pad_2d(to_categorical(x[0], hparams.quantize_channels), max_input_len)
+            for x in batch
+        ], dtype=np.float32)
     else:
         x_batch = np.array([_pad_2d(x[0].reshape(-1, 1), max_input_len)
                             for x in batch], dtype=np.float32)

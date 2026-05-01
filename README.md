@@ -8,8 +8,8 @@ We present a vision-infused method that can deal with both audio-only and audio-
 
 ## Requirements
 * [python 3](https://www.python.org/download/releases/3.6/)
-* [PyTorch](https://pytorch.org/)（version >= 0.4.1)
-* [opencv3](https://opencv.org/releases.html)
+* [PyTorch](https://pytorch.org/)（cloud training should install the CUDA build matching the target GPU)
+* [opencv-contrib-python](https://pypi.org/project/opencv-contrib-python/) for TV-L1 optical flow
 
 ## Dataset
 
@@ -54,14 +54,34 @@ Notes:
 * `--skip-existing` skips already downloaded `.mp4` files and already processed samples.
 * If you already have local videos and want to bypass `yt-dlp` entirely, run `process` directly or use `--skip-download` with `all`.
 * Download stats are estimates from `yt-dlp` metadata (`filesize` / `filesize_approx`), so totals may change over time.
-* If YouTube asks you to sign in, forward cookies or runtime flags to `yt-dlp`, for example:
+* If YouTube asks you to sign in, the recommended path is to export a fresh Netscape-format `youtube_cookies.txt` from a private/incognito browser session and pass it with `--cookies`.
+* For Windows/WSL, manual export is more reliable than `--cookies-from-browser` with Edge. `tools/export_windows_edge_cookies.sh` is kept only as a best-effort backup helper.
+* YouTube downloads also require a JavaScript runtime for challenge solving. The script defaults to `--yt-dlp-js-runtime auto` and will use `deno`, `node`, `bun`, or `qjs` if found in `PATH`.
+* If your workspace disk is tight, you can keep manifests and processed data under `data/` while sending raw videos to another drive with `--video-root`, for example `--video-root /mnt/e/raw_videos`.
+
+Example:
 
 ```bash
 uv run python main.py prepare-data -- download \
   --json data/MUSICES.json \
   --data-root data \
-  --yt-dlp-extra-arg=--cookies-from-browser \
-  --yt-dlp-extra-arg=firefox
+  --skip-existing \
+  --max-videos 1 \
+  --abort-on-download-error \
+  --yt-dlp-extra-arg=--cookies \
+  --yt-dlp-extra-arg=/home/sanmu/Vision-Infused-Audio-Inpainter-VIAI/data/youtube_cookies.txt
+```
+
+Example with raw videos on `E:` while everything else stays in the repo:
+
+```bash
+uv run python main.py prepare-data -- download \
+  --json data/MUSICES.json \
+  --data-root data \
+  --video-root /mnt/e/raw_videos \
+  --skip-existing \
+  --yt-dlp-extra-arg=--cookies \
+  --yt-dlp-extra-arg=/home/sanmu/Vision-Infused-Audio-Inpainter-VIAI/data/youtube_cookies.txt
 ```
 
 The pipeline will create:
@@ -89,8 +109,34 @@ Each processed sample contains:
 
 ## Training and Testing
 
-We are still sorting out the code. For now it is not complete thus not runable, but the architecture is revealed.
-Please wait for more details.
+This repository now separates local smoke tests from full training. A local RTX 3060-class GPU is intended only to verify that preprocessing, dataloading, model forward, and one backward/update step run. Do not treat local smoke-test settings as paper-reproduction settings.
+
+Local smoke test example:
+
+```bash
+UV_CACHE_DIR=/tmp/uv-cache uv sync --extra local-cuda
+uv run --extra local-cuda python main.py --help
+uv run --extra local-cuda python main.py prepare-data -- --help
+uv run --extra local-cuda python -c "import torch, cv2, librosa, nnmnkwii, tensorboardX; print(torch.__version__, torch.cuda.is_available(), torch.version.cuda)"
+uv run --extra local-cuda python main.py prepare-data -- process --json data/MUSICES.json --data-root data --max-videos 1 --skip-existing
+uv run --extra local-cuda python main.py prepare-data -- splits --json data/MUSICES.json --data-root data --max-videos 1
+uv run --extra local-cuda python main.py train -- --batch_size 1 --num_workers 0 --max_train_steps 1 --display_id 0
+```
+
+If local memory is still tight, temporarily lower `--image_size` or `--load_num` for smoke tests only, and keep that setting out of paper metrics.
+
+Cloud training checklist:
+
+```bash
+nvidia-smi
+UV_CACHE_DIR=/tmp/uv-cache uv sync
+uv pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+.venv/bin/python -c "import torch, cv2; print(torch.cuda.is_available(), torch.version.cuda, hasattr(cv2, 'optflow'))"
+.venv/bin/python main.py prepare-data -- all --json data/MUSICES.json --data-root data --skip-existing
+.venv/bin/python main.py train -- --batch_size 16 --num_workers 4 --display_id 0
+```
+
+For cloud runs, install the PyTorch wheel that matches the server driver/CUDA runtime; the `cu121` command above is only an example. Use `.venv/bin/python` or `uv run --no-sync` after manual PyTorch installation so `uv` does not remove the cloud-specific torch package. Use the default 4-second audio window, 80x200 Mel-spectrogram, 50 video-frame mapping, TV-L1 optical flow, contrastive margin `gamma=1`, and TensorBoard/checkpoint monitoring. Adjust batch size only when GPU memory requires it.
 
 
 ## License and Citation

@@ -96,7 +96,7 @@ class GANLoss(nn.Module):
             target_tensor = self.real_label - soft
         else:
             target_tensor = self.fake_label + soft
-        return target_tensor.expand_as(input)
+        return target_tensor.to(device=input.device, dtype=input.dtype).expand_as(input)
 
     def __call__(self, input, target_is_real, softlabel=False):
         target_tensor = self.get_target_tensor(input, target_is_real, softlabel)
@@ -114,7 +114,7 @@ class L2ContrastiveLoss(nn.Module):
     Compute L2 contrastive loss
     """
 
-    def __init__(self, margin=0, measure=False, max_violation=False):
+    def __init__(self, margin=1.0, measure=False, max_violation=False):
         super(L2ContrastiveLoss, self).__init__()
         self.margin = margin
 
@@ -134,10 +134,7 @@ class L2ContrastiveLoss(nn.Module):
         cost_s = (self.margin - scores).clamp(min=0)
 
         # clear diagonals
-        mask = torch.eye(scores.size(0)) > .5
-        I = mask
-        if torch.cuda.is_available():
-            I = I.cuda()
+        I = torch.eye(scores.size(0), device=scores.device, dtype=torch.bool)
         cost_s = cost_s.masked_fill_(I, 0)
 
         # keep the maximum violating negative for each query

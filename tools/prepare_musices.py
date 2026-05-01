@@ -14,6 +14,49 @@ DOWNLOAD_PROGRESS_TEMPLATE = (
     "[download] %(progress._percent_str)s of %(progress._total_bytes_str)s "
     "at %(progress._speed_str)s ETA %(progress._eta_str)s"
 )
+BROWSER_COOKIE_SOURCES = {
+    "firefox": {
+        "binaries": ["firefox"],
+        "dirs": [
+            "~/.config/mozilla/firefox",
+            "~/.mozilla/firefox",
+            "~/.var/app/org.mozilla.firefox/config/mozilla/firefox",
+            "~/.var/app/org.mozilla.firefox/.mozilla/firefox",
+            "~/snap/firefox/common/.mozilla/firefox",
+        ],
+    },
+    "librewolf": {
+        "binaries": ["librewolf"],
+        "dirs": [
+            "~/.librewolf",
+            "~/.var/app/io.gitlab.librewolf-community/config/librewolf",
+        ],
+    },
+    "chrome": {
+        "binaries": ["google-chrome", "chrome"],
+        "dirs": [
+            "~/.config/google-chrome",
+        ],
+    },
+    "chromium": {
+        "binaries": ["chromium", "chromium-browser"],
+        "dirs": [
+            "~/.config/chromium",
+        ],
+    },
+    "edge": {
+        "binaries": ["microsoft-edge", "microsoft-edge-stable", "edge"],
+        "dirs": [
+            "~/.config/microsoft-edge",
+        ],
+    },
+    "brave": {
+        "binaries": ["brave-browser", "brave"],
+        "dirs": [
+            "~/.config/BraveSoftware/Brave-Browser",
+        ],
+    },
+}
 
 
 def parse_args():
@@ -28,6 +71,12 @@ def parse_args():
     parser.add_argument("--json", dest="json_path", default="data/MUSICES.json")
     parser.add_argument("--data-root", default="data")
     parser.add_argument("--video-dir", default="raw_videos")
+    parser.add_argument(
+        "--video-root",
+        default=None,
+        help="Optional filesystem root for raw videos. When set, downloaded videos are "
+        "stored under this directory instead of `data-root/video-dir`.",
+    )
     parser.add_argument("--processed-dir", default="processed")
     parser.add_argument("--manifest-name", default="musices_manifest.csv")
     parser.add_argument("--train-split-name", default="train_new_split.txt")
@@ -48,6 +97,12 @@ def parse_args():
     parser.add_argument("--ref-level-db", type=float, default=20.0)
     parser.add_argument("--frame-size", type=int, default=256)
     parser.add_argument("--frame-stride", type=int, default=1)
+    parser.add_argument(
+        "--flow-method",
+        choices=["tvl1", "farneback"],
+        default="tvl1",
+        help="Optical-flow algorithm. VIAI paper uses TV-L1; Farneback is only for fallback smoke tests.",
+    )
     parser.add_argument("--flow-clip", type=float, default=20.0)
     parser.add_argument("--skip-download", action="store_true")
     parser.add_argument("--skip-existing", action="store_true")
@@ -59,6 +114,12 @@ def parse_args():
         default=[],
         help="Repeat to forward extra arguments to yt-dlp, for example "
         "`--yt-dlp-extra-arg=--cookies-from-browser --yt-dlp-extra-arg=firefox`.",
+    )
+    parser.add_argument(
+        "--yt-dlp-js-runtime",
+        default="auto",
+        help="JavaScript runtime for yt-dlp YouTube challenges. Use `auto`, `none`, "
+        "or a yt-dlp value such as `node`, `deno`, `bun`, or `quickjs:/path/to/qjs`.",
     )
     parser.add_argument("--ffmpeg-bin", default="ffmpeg")
     return parser.parse_args()
@@ -153,8 +214,14 @@ def download_failure_path(data_root):
     return Path(data_root) / "musices_download_failures.csv"
 
 
-def video_output_path(data_root, video_dir, record):
-    return Path(data_root) / video_dir / record["instrument"] / f'{record["youtube_id"]}.mp4'
+def resolved_video_root(data_root, video_dir, video_root=None):
+    if video_root is not None:
+        return Path(video_root)
+    return Path(data_root) / video_dir
+
+
+def video_output_path(data_root, video_dir, record, video_root=None):
+    return resolved_video_root(data_root, video_dir, video_root) / record["instrument"] / f'{record["youtube_id"]}.mp4'
 
 
 def sample_output_dir(data_root, processed_dir, record):
@@ -179,7 +246,16 @@ def format_bytes(value):
     return f"{size:.2f} TiB"
 
 
-def write_manifest(records, data_root, video_dir, processed_dir, manifest_name):
+def format_manifest_path(path, base_root):
+    path = Path(path)
+    base_root = Path(base_root)
+    try:
+        return path.relative_to(base_root).as_posix()
+    except ValueError:
+        return str(path)
+
+
+def write_manifest(records, data_root, video_dir, video_root, processed_dir, manifest_name):
     output = manifest_path(data_root, manifest_name)
     ensure_dir(output.parent)
     with output.open("w", encoding="utf-8", newline="") as handle:
@@ -196,8 +272,11 @@ def write_manifest(records, data_root, video_dir, processed_dir, manifest_name):
         writer.writeheader()
         for record in records:
             row = dict(record)
-            row["video_path"] = str(video_output_path(data_root, video_dir, record).relative_to(data_root))
-            row["sample_dir"] = str(sample_output_dir(data_root, processed_dir, record).relative_to(data_root))
+            row["video_path"] = format_manifest_path(
+                video_output_path(data_root, video_dir, record, video_root),
+                data_root,
+            )
+            row["sample_dir"] = sample_output_dir(data_root, processed_dir, record).relative_to(data_root).as_posix()
             writer.writerow(row)
     return output
 
@@ -216,6 +295,113 @@ def resolve_command_path(name):
     if candidate.exists():
         return str(candidate)
     return None
+
+
+def expand_paths(paths):
+    return [Path(path).expanduser() for path in paths]
+
+
+def detect_cookie_browser(extra_args):
+    for index, arg in enumerate(extra_args):
+        if arg == "--cookies-from-browser":
+            if index + 1 >= len(extra_args):
+                raise RuntimeError("`--cookies-from-browser` was provided without a browser name.")
+            return extra_args[index + 1]
+        if arg.startswith("--cookies-from-browser="):
+            return arg.split("=", 1)[1]
+    return None
+
+
+def detect_cookie_file(extra_args):
+    for index, arg in enumerate(extra_args):
+        if arg == "--cookies":
+            if index + 1 >= len(extra_args):
+                raise RuntimeError("`--cookies` was provided without a cookie file path.")
+            return extra_args[index + 1]
+        if arg.startswith("--cookies="):
+            return arg.split("=", 1)[1]
+    return None
+
+
+def has_yt_dlp_option(extra_args, option):
+    return any(arg == option or arg.startswith(f"{option}=") for arg in extra_args)
+
+
+def resolve_yt_dlp_js_runtime(preferred):
+    if preferred in {"", "none", "off", "false"}:
+        return None
+    if preferred != "auto":
+        return preferred
+    for runtime in ("deno", "node", "bun", "qjs"):
+        path = shutil.which(runtime)
+        if path:
+            if runtime == "qjs":
+                return f"quickjs:{path}"
+            return runtime
+    return None
+
+
+def build_yt_dlp_base_args(args, needs_js_runtime=False):
+    base_args = []
+    if needs_js_runtime and not has_yt_dlp_option(args.yt_dlp_extra_arg, "--js-runtimes"):
+        js_runtime = resolve_yt_dlp_js_runtime(args.yt_dlp_js_runtime)
+        if js_runtime:
+            base_args.extend(["--js-runtimes", js_runtime])
+        else:
+            print(
+                "[prepare_musices] warning: no JavaScript runtime found for yt-dlp. "
+                "YouTube may return only image/storyboard formats. Install deno or node, "
+                "or pass --yt-dlp-js-runtime manually.",
+                file=sys.stderr,
+            )
+    return base_args + list(args.yt_dlp_extra_arg)
+
+
+def validate_yt_dlp_cookie_source(extra_args):
+    cookie_file = detect_cookie_file(extra_args)
+    if cookie_file:
+        cookie_path = Path(cookie_file).expanduser()
+        if not cookie_path.exists():
+            raise RuntimeError(
+                f"Cookie file not found: {cookie_path}. "
+                "Pass an existing Netscape-format cookies file, or remove the cookie option. "
+                "For YouTube on Windows/WSL, the recommended path is to manually export a fresh "
+                "Netscape-format `youtube_cookies.txt` from a private/incognito browser session "
+                "and save it to that location. "
+                "`bash tools/export_windows_edge_cookies.sh` is only a best-effort backup helper."
+            )
+        return
+
+    browser_spec = detect_cookie_browser(extra_args)
+    if not browser_spec:
+        return
+
+    browser_name = browser_spec.split(":", 1)[0].strip().lower()
+    source = BROWSER_COOKIE_SOURCES.get(browser_name)
+    if source is None:
+        return
+
+    binaries = source["binaries"]
+    profile_dirs = expand_paths(source["dirs"])
+    found_binary = next((name for name in binaries if resolve_command_path(name)), None)
+    found_profile_dir = next((path for path in profile_dirs if path.exists()), None)
+    if found_binary and found_profile_dir:
+        return
+
+    expected_dirs = ", ".join(f"`{path}`" for path in profile_dirs)
+    binary_hint = ", ".join(f"`{name}`" for name in binaries)
+    raise RuntimeError(
+        "Unable to read browser cookies for yt-dlp. "
+        f"Requested browser: `{browser_spec}`. "
+        f"Expected a browser install ({binary_hint}) and a profile directory in {expected_dirs}, "
+        f"but found binary={bool(found_binary)} and profile_dir={bool(found_profile_dir)}. "
+        "This is usually not a filesystem permission problem. It usually means the browser is not "
+        "installed in this Linux/WSL environment, has never been launched here, or you are trying "
+        "to read cookies from a Windows browser while running inside WSL. "
+        "Fix it by either: 1) installing that browser inside this environment and logging into "
+        "YouTube once, then closing the browser; or 2) exporting cookies to a Netscape-format file "
+        "and passing `--yt-dlp-extra-arg=--cookies --yt-dlp-extra-arg=/absolute/path/cookies.txt`."
+    )
 
 
 def resolve_yt_dlp_command(preferred):
@@ -374,7 +560,8 @@ def write_stats_files(records, args, yt_dlp_command):
 
     for index, record in enumerate(records, start=1):
         print(f"[prepare_musices] stats {index}/{len(records)}: {record['sample_key']}")
-        row = inspect_record_stats(record, yt_dlp_command, args.yt_dlp_extra_arg)
+        yt_dlp_args = build_yt_dlp_base_args(args, needs_js_runtime=True)
+        row = inspect_record_stats(record, yt_dlp_command, yt_dlp_args)
         rows.append(row)
 
         instrument_summary = by_instrument.setdefault(
@@ -446,12 +633,12 @@ def load_stats_index(data_root, stats_json_name):
     return payload.get("estimated_total_bytes"), record_map
 
 
-def summarize_existing_downloads(records, data_root, video_dir):
+def summarize_existing_downloads(records, data_root, video_dir, video_root=None):
     sizes = {}
     total_bytes = 0
     completed_count = 0
     for record in records:
-        target = video_output_path(data_root, video_dir, record)
+        target = video_output_path(data_root, video_dir, record, video_root)
         size = target.stat().st_size if target.exists() else 0
         sizes[record["sample_key"]] = size
         if size > 0:
@@ -469,9 +656,10 @@ def download_video(
     skip_existing,
     archive_path,
     yt_dlp_extra_args,
+    video_root=None,
     estimated_total_bytes=None,
 ):
-    target = video_output_path(data_root, video_dir, record)
+    target = video_output_path(data_root, video_dir, record, video_root)
     ensure_dir(target.parent)
     before_bytes = target.stat().st_size if target.exists() else 0
     if skip_existing and target.exists():
@@ -634,7 +822,36 @@ def normalize_flow_component(component, flow_clip):
     return np.clip(scaled, 0.0, 255.0).astype(np.uint8)
 
 
-def extract_frames_and_flow(video_path, sample_dir, frame_size, frame_stride, flow_clip):
+def create_tvl1_flow_estimator(cv2):
+    if hasattr(cv2, "optflow") and hasattr(cv2.optflow, "DualTVL1OpticalFlow_create"):
+        return cv2.optflow.DualTVL1OpticalFlow_create()
+    if hasattr(cv2, "DualTVL1OpticalFlow_create"):
+        return cv2.DualTVL1OpticalFlow_create()
+    raise RuntimeError(
+        "TV-L1 optical flow requires opencv-contrib-python. "
+        "Install/sync dependencies, then rerun the process stage. "
+        "Use --flow-method farneback only for non-paper smoke tests."
+    )
+
+
+def compute_optical_flow(cv2, previous_gray, gray, flow_method, tvl1_estimator):
+    if flow_method == "tvl1":
+        return tvl1_estimator.calc(previous_gray, gray, None)
+    return cv2.calcOpticalFlowFarneback(
+        previous_gray,
+        gray,
+        None,
+        pyr_scale=0.5,
+        levels=3,
+        winsize=15,
+        iterations=3,
+        poly_n=5,
+        poly_sigma=1.2,
+        flags=0,
+    )
+
+
+def extract_frames_and_flow(video_path, sample_dir, frame_size, frame_stride, flow_clip, flow_method):
     cv2 = require_cv2()
     np = require_numpy()
     image_dir = sample_dir / "image"
@@ -663,6 +880,7 @@ def extract_frames_and_flow(video_path, sample_dir, frame_size, frame_stride, fl
 
     previous_gray = None
     zero_flow = np.full((frame_size, frame_size), 127, dtype=np.uint8)
+    tvl1_estimator = create_tvl1_flow_estimator(cv2) if flow_method == "tvl1" else None
     for frame_id, frame in enumerate(frames, start=1):
         cv2.imwrite(str(image_dir / f"{frame_id}.jpg"), frame)
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -670,18 +888,7 @@ def extract_frames_and_flow(video_path, sample_dir, frame_size, frame_stride, fl
             flow_x = zero_flow
             flow_y = zero_flow
         else:
-            flow = cv2.calcOpticalFlowFarneback(
-                previous_gray,
-                gray,
-                None,
-                pyr_scale=0.5,
-                levels=3,
-                winsize=15,
-                iterations=3,
-                poly_n=5,
-                poly_sigma=1.2,
-                flags=0,
-            )
+            flow = compute_optical_flow(cv2, previous_gray, gray, flow_method, tvl1_estimator)
             flow_x = normalize_flow_component(flow[..., 0], flow_clip)
             flow_y = normalize_flow_component(flow[..., 1], flow_clip)
         cv2.imwrite(str(flow_x_dir / f"{frame_id}.jpg"), flow_x)
@@ -830,7 +1037,7 @@ def processed_sample_ready(sample_dir):
 
 def process_record(record, args, ffmpeg_binary):
     data_root = Path(args.data_root)
-    video_path = video_output_path(data_root, args.video_dir, record)
+    video_path = video_output_path(data_root, args.video_dir, record, args.video_root)
     sample_dir = sample_output_dir(data_root, args.processed_dir, record)
 
     if args.skip_existing and processed_sample_ready(sample_dir):
@@ -849,6 +1056,7 @@ def process_record(record, args, ffmpeg_binary):
         frame_size=args.frame_size,
         frame_stride=args.frame_stride,
         flow_clip=args.flow_clip,
+        flow_method=args.flow_method,
     )
     crop_motion_region(sample_dir)
     mel_frames = export_audio_and_mel(sample_dir, wav_path, args)
@@ -924,10 +1132,12 @@ def run_download_stage(records, args, yt_dlp_command, ffmpeg_binary):
         records,
         data_root,
         args.video_dir,
+        args.video_root,
     )
 
     failures = []
     aborted = False
+    yt_dlp_args = build_yt_dlp_base_args(args, needs_js_runtime=True)
     for index, record in enumerate(records, start=1):
         sample_key = record["sample_key"]
         estimated_total_bytes = estimated_bytes_by_key.get(sample_key)
@@ -949,7 +1159,8 @@ def run_download_stage(records, args, yt_dlp_command, ffmpeg_binary):
             ffmpeg_binary=ffmpeg_binary,
             skip_existing=args.skip_existing,
             archive_path=archive_path,
-            yt_dlp_extra_args=args.yt_dlp_extra_arg,
+            yt_dlp_extra_args=yt_dlp_args,
+            video_root=args.video_root,
             estimated_total_bytes=estimated_total_bytes,
         )
 
@@ -989,12 +1200,15 @@ def main():
     data_root = Path(args.data_root)
     ensure_dir(data_root)
     records = load_records(args.json_path, max_videos=args.max_videos)
+    if args.action in {"stats", "download", "all"}:
+        validate_yt_dlp_cookie_source(args.yt_dlp_extra_arg)
 
     if args.action in {"manifest", "all"}:
         output = write_manifest(
             records=records,
             data_root=data_root,
             video_dir=args.video_dir,
+            video_root=args.video_root,
             processed_dir=args.processed_dir,
             manifest_name=args.manifest_name,
         )
@@ -1026,7 +1240,7 @@ def main():
     if args.action in {"process", "all"}:
         ffmpeg_binary = resolve_ffmpeg_binary(args.ffmpeg_bin)
         for index, record in enumerate(records, start=1):
-            video_path = video_output_path(data_root, args.video_dir, record)
+            video_path = video_output_path(data_root, args.video_dir, record, args.video_root)
             if not video_path.exists():
                 print(f"[prepare_musices] skip missing video {record['sample_key']}: {video_path}")
                 continue
