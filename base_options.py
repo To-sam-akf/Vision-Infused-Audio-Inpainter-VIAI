@@ -33,6 +33,12 @@ class BaseOptions(object):
         self.parser.add_argument("--checkpoint_dir", type=str, default="./checkpoints")
         self.parser.add_argument("--checkpoints_dir", type=str, default="./checkpoints")
         self.parser.add_argument("--log_event_path", type=str, default=None)
+        self.parser.add_argument(
+            "--results_dir",
+            type=str,
+            default="./checkpoints/viai_a_test_results",
+            help="Directory for VIAI-A test JSON files and CSV summaries.",
+        )
         self.parser.add_argument("--save_optimizer_state", type=bool, default=True)
 
         # Runtime

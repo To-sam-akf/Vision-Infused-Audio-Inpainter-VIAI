@@ -86,6 +86,66 @@ def mel_image_batches(mel_input, mel_pred, mel_target, max_items=4):
     }
 
 
+def _mel_to_uint8_image(mel_2d):
+    array = torch.clamp(mel_2d.detach().cpu(), 0.0, 1.0).numpy()
+    return (array * 255.0).round().astype(np.uint8)
+
+
+def save_mel_comparison_png(path, mel_input, mel_pred, mel_target):
+    from PIL import Image, ImageDraw
+
+    panels = [
+        ("masked input", _mel_to_uint8_image(mel_input)),
+        ("prediction", _mel_to_uint8_image(mel_pred)),
+        ("target", _mel_to_uint8_image(mel_target)),
+        ("abs error", _mel_to_uint8_image(torch.abs(mel_pred - mel_target))),
+    ]
+    label_height = 18
+    gap = 4
+    panel_width = panels[0][1].shape[1]
+    panel_height = panels[0][1].shape[0]
+    canvas_width = panel_width * len(panels) + gap * (len(panels) - 1)
+    canvas_height = panel_height + label_height
+    canvas = Image.new("L", (canvas_width, canvas_height), color=255)
+    draw = ImageDraw.Draw(canvas)
+
+    x_offset = 0
+    for label, array in panels:
+        panel = Image.fromarray(array, mode="L")
+        canvas.paste(panel, (x_offset, label_height))
+        draw.text((x_offset + 2, 2), label, fill=0)
+        x_offset += panel_width + gap
+
+    canvas.save(path)
+
+
+def save_mel_comparison_batch(output_dir, start_index, paths, mel_input, mel_pred, mel_target):
+    import os
+    import re
+
+    os.makedirs(output_dir, exist_ok=True)
+    mel_input = torch.clamp(_as_bchw(mel_input).detach().cpu(), 0.0, 1.0)
+    mel_pred = torch.clamp(_as_bchw(mel_pred).detach().cpu(), 0.0, 1.0)
+    mel_target = torch.clamp(_as_bchw(mel_target).detach().cpu(), 0.0, 1.0)
+
+    written_paths = []
+    for index in range(mel_target.size(0)):
+        sample_path = paths[index] if index < len(paths) else f"sample_{start_index + index}"
+        safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", sample_path).strip("_")
+        if not safe_name:
+            safe_name = "sample"
+        filename = f"{start_index + index:06d}_{safe_name}.png"
+        output_path = os.path.join(output_dir, filename)
+        save_mel_comparison_png(
+            output_path,
+            mel_input[index, 0],
+            mel_pred[index, 0],
+            mel_target[index, 0],
+        )
+        written_paths.append(output_path)
+    return written_paths
+
+
 def write_mel_images(writer, prefix, step, mel_input, mel_pred, mel_target, max_items=4):
     global _IMAGE_WRITE_WARNING_SHOWN
     if writer is None:

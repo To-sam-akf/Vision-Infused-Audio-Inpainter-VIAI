@@ -591,3 +591,119 @@ VIAI-A 测试入口已通过：
 ```text
 [VIAI-A test] samples=1 loss=0.356585 mel_l1_full=0.163478 mel_l1_missing=0.193108 psnr_full=13.548 psnr_missing=12.252 ssim=0.1417
 ```
+
+## 2026-05-02 VIAI-A 测试结果 JSON/CSV 持久化
+
+### 修改内容
+1. `base_options.py`
+   - 新增 `--results_dir`，默认 `./checkpoints/viai_a_test_results`。
+2. `test_viai_a.py`
+   - 每次测试后保存 checkpoint 专属 JSON：
+     - `VIAI-A_step000001000_test.json`
+   - 同步维护 CSV 总表：
+     - `VIAI-A_test_summary.csv`
+   - CSV 按 `checkpoint_step` 升序排列。
+   - 同一个 checkpoint 重复测试会覆盖旧行，不会追加重复行。
+   - 记录字段包括 checkpoint path/step、global step/epoch、test split、样本数、loss、L1、PSNR、SSIM。
+3. `README.md`
+   - VIAI-A 测试命令增加 `--results_dir` 示例。
+   - 说明逐个测试多个 checkpoint 后可用 `VIAI-A_test_summary.csv` 横向比较。
+
+### 验证命令
+```bash
+.venv/bin/python -m py_compile test_viai_a.py base_options.py
+.venv/bin/python main.py test-viai-a -- --resume_path ./checkpoints/VIAI-A_checkpoint_step000000001.pth.tar --test_split_name train_viai_a_split.txt --batch_size 1 --num_workers 0 --display_id 0 --results_dir checkpoints/viai_a_test_results
+.venv/bin/python main.py test-viai-a -- --resume_path ./checkpoints/VIAI-A_checkpoint_step000000001.pth.tar --test_split_name train_viai_a_split.txt --batch_size 1 --num_workers 0 --display_id 0 --results_dir checkpoints/viai_a_test_results
+```
+
+### 待记录 smoke test 关键输出
+```text
+[VIAI-A test] wrote json: checkpoints/viai_a_test_results/VIAI-A_step000000001_test.json
+[VIAI-A test] wrote summary csv: checkpoints/viai_a_test_results/VIAI-A_test_summary.csv
+```
+
+### 本次实际验证结果
+静态检查已通过：
+```bash
+.venv/bin/python -m py_compile test_viai_a.py base_options.py
+```
+
+重复测试同一个 checkpoint 已通过，CSV 未产生重复行：
+```bash
+.venv/bin/python main.py test-viai-a -- --data_root data --resume_path ./checkpoints/VIAI-A_checkpoint_step000000001.pth.tar --test_split_name train_viai_a_split.txt --batch_size 1 --num_workers 0 --display_id 0 --results_dir checkpoints/viai_a_test_results
+.venv/bin/python main.py test-viai-a -- --data_root data --resume_path ./checkpoints/VIAI-A_checkpoint_step000000001.pth.tar --test_split_name train_viai_a_split.txt --batch_size 1 --num_workers 0 --display_id 0 --results_dir checkpoints/viai_a_test_results
+wc -l checkpoints/viai_a_test_results/VIAI-A_test_summary.csv
+```
+
+关键输出：
+```text
+[VIAI-A test] wrote json: checkpoints/viai_a_test_results/VIAI-A_step000000001_test.json
+[VIAI-A test] wrote summary csv: checkpoints/viai_a_test_results/VIAI-A_test_summary.csv
+2 checkpoints/viai_a_test_results/VIAI-A_test_summary.csv
+```
+
+本地 smoke test 使用随机 mask，同一 checkpoint 重测的 loss/PSNR/SSIM 可能略有变化；CSV 会保留最近一次该 checkpoint 的结果。
+
+## 2026-05-02 VIAI-A 测试 Mel 图片保存
+
+### 修改内容
+1. `utils/viai_a_metrics.py`
+   - 新增 `save_mel_comparison_png()`，保存单个样本四联图：
+     - masked input
+     - prediction
+     - target
+     - abs error
+   - 新增 `save_mel_comparison_batch()`，按 batch 批量保存测试样本图片。
+   - PNG 使用 normalized Mel `[0, 1]` 映射到灰度 `[0, 255]`。
+2. `test_viai_a.py`
+   - 测试时为每个样本保存一张 Mel 对比 PNG。
+   - 输出目录为：
+     - `<results_dir>/mel-image/stepXXXXXXXXX/`
+   - 文件名包含全局样本序号和安全化后的 split sample path。
+   - 保留原有 JSON/CSV 指标输出不变。
+3. `README.md`
+   - VIAI-A 测试结果说明中新增 Mel 图片输出路径和四联图内容。
+
+### 验证命令
+```bash
+.venv/bin/python -m py_compile test_viai_a.py utils/viai_a_metrics.py
+.venv/bin/python main.py test-viai-a -- --data_root data --resume_path ./checkpoints/VIAI-A_checkpoint_step000000001.pth.tar --test_split_name train_viai_a_split.txt --batch_size 1 --num_workers 0 --display_id 0 --results_dir checkpoints/viai_a_test_results
+.venv/bin/python -c "from PIL import Image; import glob; path=glob.glob('checkpoints/viai_a_test_results/mel-image/step000000001/*.png')[0]; Image.open(path).verify(); print(path)"
+```
+
+### 待记录 smoke test 关键输出
+```text
+[VIAI-A test] wrote mel images: checkpoints/viai_a_test_results/mel-image/step000000001
+checkpoints/viai_a_test_results/mel-image/step000000001/000000_*.png
+```
+
+### 本次实际验证结果
+静态检查已通过：
+```bash
+.venv/bin/python -m py_compile test_viai_a.py utils/viai_a_metrics.py
+```
+
+VIAI-A 测试 smoke test 已通过：
+```bash
+.venv/bin/python main.py test-viai-a -- --data_root data --resume_path ./checkpoints/VIAI-A_checkpoint_step000000001.pth.tar --test_split_name train_viai_a_split.txt --batch_size 1 --num_workers 0 --display_id 0 --results_dir checkpoints/viai_a_test_results
+```
+
+关键输出：
+```text
+[VIAI-A test] samples=1 loss=0.328249 mel_l1_full=0.163457 mel_l1_missing=0.164792 psnr_full=13.550 psnr_missing=13.643 ssim=0.1415
+[VIAI-A test] wrote json: checkpoints/viai_a_test_results/VIAI-A_step000000001_test.json
+[VIAI-A test] wrote summary csv: checkpoints/viai_a_test_results/VIAI-A_test_summary.csv
+[VIAI-A test] wrote mel images: checkpoints/viai_a_test_results/mel-image/step000000001
+```
+
+PNG 输出和 PIL 校验已通过：
+```bash
+find checkpoints/viai_a_test_results/mel-image/step000000001 -maxdepth 1 -type f -name '*.png'
+.venv/bin/python -c "from PIL import Image; import glob; path=glob.glob('checkpoints/viai_a_test_results/mel-image/step000000001/*.png')[0]; Image.open(path).verify(); print(path)"
+```
+
+关键输出：
+```text
+000000_processed_accordion_A2p8VW61RGc.png
+checkpoints/viai_a_test_results/mel-image/step000000001/000000_processed_accordion_A2p8VW61RGc.png
+```

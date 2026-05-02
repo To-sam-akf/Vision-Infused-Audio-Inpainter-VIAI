@@ -1,0 +1,2 @@
+checkpoint_path,checkpoint_step,global_step,global_epoch,test_split_name,num_samples,loss_total,mel_l1_full,mel_l1_missing,psnr_full,psnr_missing,ssim
+/home/sanmu/Vision-Infused-Audio-Inpainter-VIAI/checkpoints/VIAI-A_checkpoint_step000000001.pth.tar,1,1,0,train_viai_a_split.txt,1,0.3282485604286194,0.16345664858818054,0.16479191184043884,13.549606323242188,13.643174171447754,0.1415174575904991

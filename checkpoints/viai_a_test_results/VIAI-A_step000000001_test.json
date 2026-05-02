@@ -1,0 +1,14 @@
+{
+  "checkpoint_path": "/home/sanmu/Vision-Infused-Audio-Inpainter-VIAI/checkpoints/VIAI-A_checkpoint_step000000001.pth.tar",
+  "checkpoint_step": 1,
+  "global_step": 1,
+  "global_epoch": 0,
+  "test_split_name": "train_viai_a_split.txt",
+  "num_samples": 1,
+  "loss_total": 0.3282485604286194,
+  "mel_l1_full": 0.16345664858818054,
+  "mel_l1_missing": 0.16479191184043884,
+  "psnr_full": 13.549606323242188,
+  "psnr_missing": 13.643174171447754,
+  "ssim": 0.1415174575904991
+}
