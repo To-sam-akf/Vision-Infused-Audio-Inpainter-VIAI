@@ -5,8 +5,13 @@ import sys
 
 MODULE_MAP = {
     "train": "train_whole_sync",
+    "test": "test_whole_sync",
     "preprocess": "tools.prepare_musices",
     "prepare-data": "tools.prepare_musices",
+    "prepare-viai-a": "tools.prepare_viai_a",
+    "split-data": "tools.split_musices",
+    "train-viai-a": "train_viai_a",
+    "test-viai-a": "test_viai_a",
 }
 
 

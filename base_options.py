@@ -14,12 +14,15 @@ class BaseOptions(object):
         # Basic
         self.parser.add_argument("--name", type=str, default="VIAI-AV")
         self.parser.add_argument("--isTrain", type=bool, default=True)
-        self.parser.add_argument("--data_root", type=str, default="./data")
-        self.parser.add_argument("--image_path", type=str, default="./data")
+        self.parser.add_argument("--data_root", type=str, default="/root/shared-nvme/data")
+        self.parser.add_argument("--image_path", type=str, default="/root/shared-nvme/data")
         self.parser.add_argument("--speaker_id", type=int, default=None)
         self.parser.add_argument("--test_size", type=float, default=0.05)
         self.parser.add_argument("--metadata_name", type=str, default="metadata.csv")
         self.parser.add_argument("--new_split_name", type=str, default="_new_split.txt")
+        self.parser.add_argument("--train_split_name", type=str, default="train_new_split.txt")
+        self.parser.add_argument("--val_split_name", type=str, default="val_new_split.txt")
+        self.parser.add_argument("--test_split_name", type=str, default="test_new_split.txt")
 
         # Resume / checkpoint
         self.parser.add_argument("--resume", action="store_true")
@@ -46,6 +49,24 @@ class BaseOptions(object):
         self.parser.add_argument("--display_winsize", type=int, default=256)
         self.parser.add_argument("--display_port", type=int, default=8097)
         self.parser.add_argument("--display_single_pane_ncols", type=int, default=0)
+        self.parser.add_argument(
+            "--metric_freq",
+            type=int,
+            default=100,
+            help="For VIAI-A training, compute CPU-heavy SSIM every N steps.",
+        )
+        self.parser.add_argument(
+            "--tb_image_freq",
+            type=int,
+            default=500,
+            help="For VIAI-A training, write Mel comparison images every N steps.",
+        )
+        self.parser.add_argument(
+            "--tb_image_count",
+            type=int,
+            default=4,
+            help="Maximum number of VIAI-A Mel samples to write to TensorBoard.",
+        )
 
         # Optimization
         self.parser.add_argument("--nepochs", type=int, default=100)
@@ -105,7 +126,7 @@ class BaseOptions(object):
         self.parser.add_argument("--image_size", type=int, default=256)
         self.parser.add_argument("--image_rescal_size", type=int, default=256)
         self.parser.add_argument("--image_channel_size", type=int, default=3)
-        self.parser.add_argument("--image_hope_size", type=int, default=1)
+        self.parser.add_argument("--image_hope_size", type=int, default=2)
         self.parser.add_argument("--image", type=bool, default=True)
         self.parser.add_argument("--flow", type=bool, default=True)
         self.parser.add_argument("--load_num", type=int, default=1)

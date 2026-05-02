@@ -1,7 +1,6 @@
 from __future__ import print_function
 import torch
 import numpy as np
-from PIL import Image
 import inspect, re
 from sklearn.metrics.pairwise import euclidean_distances
 import torch.nn as nn
@@ -50,6 +49,7 @@ def diagnose_network(net, name='network'):
 
 
 def save_image(image_numpy, image_path):
+    from PIL import Image
     image_pil = Image.fromarray(image_numpy)
     image_pil.save(image_path)
 

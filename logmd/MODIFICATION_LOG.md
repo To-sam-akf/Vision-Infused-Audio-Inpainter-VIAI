@@ -68,7 +68,7 @@ uv run --extra local-cuda python main.py --help
 uv run --extra local-cuda python main.py prepare-data -- --help
 uv run --extra local-cuda python -c "import torch, cv2, librosa, nnmnkwii, tensorboardX; print(torch.__version__, torch.cuda.is_available(), torch.version.cuda)"
 uv run --extra local-cuda python main.py prepare-data -- process --json data/MUSICES.json --data-root data --max-videos 1 --skip-existing
-uv run --extra local-cuda python main.py prepare-data -- splits --json data/MUSICES.json --data-root data --max-videos 1
+uv run --extra local-cuda python main.py split-data -- --data-root data --max-samples 1 --test-size 0 --val-size 0 --allow-empty-eval
 uv run --extra local-cuda python main.py train -- --batch_size 1 --num_workers 0 --max_train_steps 1 --display_id 0
 ```
 
@@ -86,13 +86,14 @@ UV_CACHE_DIR=/tmp/uv-cache uv sync
 uv pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 .venv/bin/python -c "import torch, cv2; print(torch.cuda.is_available(), torch.version.cuda, hasattr(cv2, 'optflow'))"
 .venv/bin/python main.py prepare-data -- all --json data/MUSICES.json --data-root data --skip-existing
+.venv/bin/python main.py split-data -- --data-root data
 .venv/bin/python main.py train -- --batch_size 16 --num_workers 4 --display_id 0
 ```
 
 云端训练前需要重新确认：
 1. CUDA 版 PyTorch 与云端驱动匹配。
 2. `opencv-contrib-python` 的 TV-L1 接口可用。
-3. 完整数据已经完成 `process` 和 `splits`。
+3. 完整数据已经完成 `process` 和 `split-data`，默认生成 85% train / 5% val / 10% test。
 4. checkpoint、TensorBoard 日志、retrieval 指标可以正常写入。
 5. 先跑 100-500 step sanity training，再启动长训练。
 
@@ -103,3 +104,490 @@ uv pip install torch torchvision torchaudio --index-url https://download.pytorch
 2. 论文的 10% fixed test + 5% held-out validation 协议尚未完整接入训练 loader。
 3. VIAI-AA' probe loss 和 WaveNet spectrogram-to-audio 端到端评估仍需后续补齐。
 4. 本地 smoke test 只证明链路可运行，不代表模型收敛或论文指标。
+
+## 2026-05-01 独立 split 工具与 50 帧对齐
+
+### 修改内容
+1. 新增 `tools/split_musices.py`，从 `data/processed/<instrument>/<youtube_id>/` 扫描已处理样本并生成：
+   - `train_new_split.txt`
+   - `val_new_split.txt`
+   - `test_new_split.txt`
+2. 新 split 工具默认 `test_size=0.10`、`val_size=0.05`，剩余为 train；支持 `--max-samples` 与 `--allow-empty-eval` 方便本地 smoke test。
+3. `main.py` 新增 `split-data -> tools.split_musices`。
+4. `prepare_musices.py` 原 `splits` action 仅保留 legacy 兼容，并打印提示推荐使用 `split-data`。
+5. `base_options.py` 新增 `train_split_name`、`val_split_name`、`test_split_name`，并将 `image_hope_size` 默认改为 2。
+6. `Data_loaders/audio_loader.py` 默认读取 `train+val`；空的 val/test split 会跳过，test 保留给最终评估。
+7. 4 秒视频窗口改为默认 50 帧：从 25fps 原始帧中按 `image_hope_size=2` 抽帧，并用时间换算对齐 200 个 mel frames。
+
+### 推荐命令
+```bash
+uv run --extra local-cuda python main.py split-data -- --data-root data
+uv run --extra local-cuda python main.py split-data -- --data-root data --max-samples 1 --test-size 0 --val-size 0 --allow-empty-eval
+```
+
+### split 数据处理测试运行命令
+前置条件：`split-data` 只扫描已经完成预处理的样本，必须先存在至少一个完整目录：
+`data/processed/<instrument>/<youtube_id>/`，且其中包含 `raw_audio.npy`、`mel.npy`、`image_crop/`、`flow_x_crop/`、`flow_y_crop/`。
+
+1. 检查 split 命令参数：
+```bash
+UV_CACHE_DIR=/tmp/uv-cache uv run --extra local-cuda python main.py split-data -- --help
+```
+
+2. 检查当前是否已有完整 processed 样本目录：
+```bash
+find data/processed -mindepth 2 -maxdepth 2 -type d | head
+find data/processed -mindepth 3 -maxdepth 3 \( -name raw_audio.npy -o -name mel.npy -o -name image_crop -o -name flow_x_crop -o -name flow_y_crop \) | head -30
+```
+
+3. 如果还没有完整 processed 样本，先处理一批本地已有视频。不要把 `--max-videos` 设得太小，否则可能只扫到缺失 mp4 并直接跳过：
+```bash
+UV_CACHE_DIR=/tmp/uv-cache uv run --extra local-cuda python main.py prepare-data -- process --json data/MUSICES.json --data-root data --max-videos 100 --skip-existing
+```
+
+4. 本地 smoke test：只取 1 个可用样本，允许 val/test 为空，用来验证 split 工具、进度条和输出格式：
+```bash
+UV_CACHE_DIR=/tmp/uv-cache uv run --extra local-cuda python main.py split-data -- --data-root data --max-samples 1 --test-size 0 --val-size 0 --allow-empty-eval
+```
+
+5. 检查 smoke split 输出：
+```bash
+wc -l data/train_new_split.txt data/val_new_split.txt data/test_new_split.txt
+sed -n '1,5p' data/train_new_split.txt
+```
+
+6. 完整数据划分：默认生成 85% train、5% val、10% test：
+```bash
+UV_CACHE_DIR=/tmp/uv-cache uv run --extra local-cuda python main.py split-data -- --data-root data
+```
+
+7. 完整 split 后再次检查行数：
+```bash
+wc -l data/train_new_split.txt data/val_new_split.txt data/test_new_split.txt
+```
+
+常见报错：
+1. `Processed data directory not found: data/processed`：还没有成功运行 `prepare-data -- process`。
+2. `No processed samples found. Run the process stage first.`：`data/processed` 存在，但样本不完整，通常缺少 `mel.npy`、`raw_audio.npy` 或 crop 后的 `image_crop/flow_x_crop/flow_y_crop`。
+3. `--skip-existing: command not found`：多行命令中反斜杠 `\` 后面有空格，需保证 `\` 是该行最后一个字符。
+
+## 2026-05-01 论文对齐的数据管线、split 和测试入口
+
+### 背景
+前一版 `split-data` 只做样本级 train/val/test 划分，尚未处理论文协议中的几个关键点：
+1. 论文先做 video-level train/test split，再从对应视频生成样本，避免同一视频片段跨集合泄漏。
+2. 论文会裁掉每个视频前 6 秒，并按 shot 处理视频，去除黑场/静音或非演奏片段。
+3. 公开 `MUSICES.json` 只有 instrument 和 YouTube ID，没有原论文内部 shot 边界标注，因此本仓库只能用可复现的 OpenCV frame-difference heuristic 近似 shot detection。
+4. 原 `main.py` 没有真实测试入口，README 也缺少完整的“数据准备/划分、训练、测试”命令。
+
+### 本次修改内容
+1. `tools/prepare_musices.py`
+   - 新增论文风格预处理参数：
+     - `--trim-start-sec`，默认 6.0，对齐论文裁掉视频开头 6 秒。
+     - `--min-segment-sec`，默认 4.0，对齐 4 秒输入窗口。
+     - `--shot-detection` / `--no-shot-detection`，默认开启 shot detection。
+     - `--shot-diff-threshold`，默认 35.0，用于 OpenCV 灰度帧差 shot boundary 近似。
+     - `--black-frame-threshold`、`--max-black-ratio`，用于过滤黑场片段。
+     - `--min-audio-rms`，用于过滤近似静音片段。
+   - 默认将每个有效 shot 写到：
+     - `data/processed/<instrument>/<youtube_id>/shot_000000/`
+     - `data/processed/<instrument>/<youtube_id>/shot_000001/`
+   - 每个 shot 样本仍生成 `source.wav`、`raw_audio.npy`、`mel.npy`、`image/`、`flow_x/`、`flow_y/`、`image_crop/`、`flow_x_crop/`、`flow_y_crop/`。
+   - 保留旧式整视频处理兼容模式：
+```bash
+UV_CACHE_DIR=/tmp/uv-cache uv run --extra local-cuda python main.py prepare-data -- process --json data/MUSICES.json --data-root data --skip-existing --no-shot-detection --trim-start-sec 0
+```
+   - `prepare-data -- all` 不再自动写 legacy two-way split，完成处理后提示继续运行 `main.py split-data`。
+
+2. `tools/split_musices.py`
+   - 递归发现 processed 样本，兼容旧 flat 样本和新 `shot_*` 样本。
+   - 对样本按源视频 key `<instrument>/<youtube_id>` 分组，再做 train/val/test split，避免同一视频的不同 shot 泄漏到不同 split。
+   - 默认仍为论文比例：85% train、5% val、10% test。
+   - split 输出格式保持不变：`sample_dir|mel_path|audio_path|mel_frames`，兼容当前 dataloader。
+   - split summary 新增样本数和源视频数，例如 `train=1 samples/1 videos`。
+   - 若同一视频目录里同时存在旧 flat 样本和新 `shot_*` 样本，优先使用 shot 样本，跳过父目录旧样本。
+
+3. 测试入口
+   - `main.py` 新增 `test -> test_whole_sync`。
+   - 新增 `test_whole_sync.py`，加载 `test_new_split.txt`，恢复 checkpoint，仅执行 evaluation，不做 optimizer update。
+   - 输出 test reconstruction loss、Mel L1 loss、sync loss，以及 audio-video retrieval 指标。
+   - 如果传入的 `--resume_path` 不存在，会在同目录或 `--checkpoint_dir` 下查找最新的 `VIAI-AV_checkpoint_step*.pth.tar`。
+
+4. README
+   - 重写数据准备和 dataset split 流程命令。
+   - 写入训练 smoke test、云端完整训练、测试集评估命令。
+   - 明确说明 shot detection 是公开数据条件下的 OpenCV 近似，不是论文内部人工/原始 shot 标注。
+   - 明确当前 `main.py test` 输出当前模型路径下的 loss 和 retrieval 指标；完整 SDR/OPS 仍需要后续补 WaveNet/audio-generation evaluation。
+
+5. 为通过 smoke test 顺手修正的兼容问题
+   - `train_whole_sync.py`：`matplotlib` 改为可选导入，缺包时不阻塞训练。
+   - `utils/util.py`：`PIL.Image` 改为 `save_image()` 内部懒加载，避免非图片保存路径强依赖 Pillow。
+   - `visdom_utils/visualizer.py`：移除顶层 `html` 导入，避免 `display_id=0` 时被 `dominate` 缺包阻塞。
+   - `networks/Image_Embedding.py`：将固定 `AvgPool2d(7)` 改为 `AdaptiveAvgPool2d((1, 1))`，修复默认 `image_size=256` 下 `mat1 and mat2 shapes cannot be multiplied` 的视觉 encoder 维度错误。
+
+### README 中记录的完整流程命令
+1. 环境检查：
+```bash
+UV_CACHE_DIR=/tmp/uv-cache uv sync --extra local-cuda
+UV_CACHE_DIR=/tmp/uv-cache uv run --extra local-cuda python -c "import torch, cv2, librosa, nnmnkwii, tensorboardX, tqdm; print(torch.__version__, torch.cuda.is_available(), hasattr(cv2, 'optflow'))"
+```
+
+2. 数据准备：
+```bash
+UV_CACHE_DIR=/tmp/uv-cache uv run --extra local-cuda python main.py prepare-data -- manifest --json data/MUSICES.json --data-root data
+UV_CACHE_DIR=/tmp/uv-cache uv run --extra local-cuda python main.py prepare-data -- stats --json data/MUSICES.json --data-root data
+UV_CACHE_DIR=/tmp/uv-cache uv run --extra local-cuda python main.py prepare-data -- download --json data/MUSICES.json --data-root data --skip-existing
+UV_CACHE_DIR=/tmp/uv-cache uv run --extra local-cuda python main.py prepare-data -- process --json data/MUSICES.json --data-root data --skip-existing
+```
+
+3. 数据集划分：
+```bash
+UV_CACHE_DIR=/tmp/uv-cache uv run --extra local-cuda python main.py split-data -- --data-root data
+```
+
+4. 本地 smoke split：
+```bash
+UV_CACHE_DIR=/tmp/uv-cache uv run --extra local-cuda python main.py prepare-data -- process --json data/MUSICES.json --data-root data --max-videos 100 --skip-existing
+UV_CACHE_DIR=/tmp/uv-cache uv run --extra local-cuda python main.py split-data -- --data-root data --max-samples 1 --test-size 0 --val-size 0 --allow-empty-eval
+wc -l data/train_new_split.txt data/val_new_split.txt data/test_new_split.txt
+sed -n '1,5p' data/train_new_split.txt
+```
+
+5. 本地训练 smoke test：
+```bash
+UV_CACHE_DIR=/tmp/uv-cache uv run --extra local-cuda python main.py train -- --batch_size 1 --num_workers 0 --max_train_steps 1 --display_id 0
+```
+
+6. 云端完整训练：
+```bash
+nvidia-smi
+UV_CACHE_DIR=/tmp/uv-cache uv sync
+uv pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+.venv/bin/python -c "import torch, cv2; print(torch.cuda.is_available(), torch.version.cuda, hasattr(cv2, 'optflow'))"
+.venv/bin/python main.py prepare-data -- all --json data/MUSICES.json --data-root data --skip-existing
+.venv/bin/python main.py split-data -- --data-root data
+.venv/bin/python main.py train -- --batch_size 16 --num_workers 4 --display_id 0
+```
+
+7. 测试集评估：
+```bash
+.venv/bin/python main.py test -- --resume_path checkpoints/VIAI-AV_checkpoint_step000001000.pth.tar --batch_size 16 --num_workers 4 --display_id 0
+```
+
+### 本次实际验证结果
+已通过：
+```bash
+.venv/bin/python -m py_compile tools/prepare_musices.py tools/split_musices.py main.py test_whole_sync.py
+.venv/bin/python main.py prepare-data -- process --help
+.venv/bin/python main.py split-data -- --help
+.venv/bin/python main.py test -- --help
+.venv/bin/python main.py split-data -- --data-root data --max-samples 1 --test-size 0 --val-size 0 --allow-empty-eval
+```
+
+本地训练 smoke test 已通过：
+```bash
+.venv/bin/python main.py train -- --batch_size 1 --num_workers 0 --max_train_steps 1 --display_id 0
+```
+
+关键输出：
+```text
+Reached local smoke-test max_train_steps=1
+Step 1 L1_loss [train] Loss: 0.5894665718078613
+VIAI-AV Step 1 [train] EmbeddingL2_loss: 1.0002461671829224
+Saved checkpoint: ./checkpoints/VIAI-AV_checkpoint_step000000001.pth.tar
+Finished
+```
+
+测试入口已通过 smoke 验证。由于本地 smoke split 的 `test_new_split.txt` 为空，使用 `--test_split_name train_new_split.txt` 临时验证测试代码路径：
+```bash
+.venv/bin/python main.py test -- --resume_path ./checkpoints/VIAI-AV_checkpoint_step000000001.pth.tar --test_split_name train_new_split.txt --batch_size 1 --num_workers 0 --display_id 0
+```
+
+关键输出：
+```text
+[test] losses: reconstruction=1.380574, mel_l1=0.250176, sync=1.061548
+[test] Video Retrieval (1 samples): R@1: 100.00, R@5: 100.00, R@10: 100.00, R@50: 100.00, MedR: 1.0, MeanR: 1.0
+[test] Audio Retrieval (1 samples): R@1: 100.00, R@5: 100.00, R@10: 100.00, R@50: 100.00, MedR: 1.0, MeanR: 1.0
+```
+
+### 仍需后续补齐
+1. 当前 shot detection 是 OpenCV frame-difference heuristic，无法等价论文内部原始 shot 边界标注。
+2. 黑场/静音过滤是可复现近似规则，尚未完全覆盖论文中的“非演奏片段”人工/规则清洗。
+3. `main.py test` 当前评估当前 VIAI 模型路径下的 loss 和 retrieval 指标；论文完整 SDR/OPS 仍需要 WaveNet/audio-generation evaluation 链路。
+
+## 2026-05-01 11.00 pm VIAI-A 第一阶段 audio-only 复现入口
+
+### 背景与目标
+根据 `information.md` 中“8.1 第一阶段：复现 VIAI-A”的要求，本次新增一个独立的 audio-only 最小复现链路。该阶段只做 Mel-spectrogram inpainting，不使用视频帧、光流、visual encoder、sync loss、GAN loss 或 WaveNet，目标是先跑通：
+
+```text
+MUSICES raw video -> 16kHz mono audio -> 80-bin Mel -> random 0.4s-1.0s mask -> MelEncoder + MelDecoder -> L1 / PSNR / SSIM
+```
+
+### 本次修改内容
+1. `main.py`
+   - 新增 `prepare-viai-a -> tools.prepare_viai_a`。
+   - 新增 `train-viai-a -> train_viai_a`。
+   - 新增 `test-viai-a -> test_viai_a`。
+
+2. `tools/prepare_viai_a.py`
+   - 新增 VIAI-A audio-only 处理脚本。
+   - 复用 `tools.prepare_musices` 中的 MUSICES 记录读取、raw video 路径解析、ffmpeg 解析、音频抽取和 Mel 生成函数。
+   - 从 `data/raw_videos/<instrument>/<youtube_id>.mp4` 抽取 `source.wav`，并生成 `raw_audio.npy` 与 `mel.npy`。
+   - 默认使用论文参数：16kHz mono、STFT length 1280、hop size 320、80 Mel bins、125Hz-7.6kHz。
+   - 输出目录复用 `data/processed/<instrument>/<youtube_id>/`，不要求存在 `image_crop/flow_x_crop/flow_y_crop`。
+
+3. `tools/split_musices.py`
+   - 新增 `--audio-only`。
+   - audio-only 模式只检查 `raw_audio.npy` 和 `mel.npy`。
+   - 若未显式指定 split 文件名，默认输出：
+     - `train_viai_a_split.txt`
+     - `val_viai_a_split.txt`
+     - `test_viai_a_split.txt`
+   - 仍按 source video key 分组，避免同一原视频跨 train/val/test 泄漏。
+
+4. `Data_loaders/viai_a_loader.py`
+   - 新增 VIAI-A 专用 dataloader。
+   - 从 split 文件读取 `mel.npy` 与 `raw_audio.npy`。
+   - 训练阶段随机裁剪 4 秒窗口，即 200 个 Mel frames。
+   - 验证/测试阶段使用居中窗口。
+   - batch 只返回 `mel`、`audio`、`path`，不读取图片或光流。
+
+5. `Models/VIAI_A_inpainting.py`
+   - 新增 `VIAIAModel`。
+   - 只包含 `MelEncoder`、`MelDecoder` 和 Adam optimizer。
+   - 使用 `mel_loader.corrupt_mel_spectrogram()` 随机 mask 20-50 个 Mel frames。
+   - 优化目标为 `eta1 * full_l1 + missing_l1`。
+   - checkpoint 命名为 `VIAI-A_checkpoint_step*.pth.tar`。
+
+6. `train_viai_a.py`
+   - 新增 VIAI-A 训练入口。
+   - 支持 `--max_train_steps`，用于本地 smoke test。
+   - 写入 TensorBoard 标量：total loss、full Mel L1、missing-region Mel L1。
+
+7. `test_viai_a.py`
+   - 新增 VIAI-A 测试入口。
+   - 自动查找或加载 `VIAI-A_checkpoint_step*.pth.tar`。
+   - 在 `test_viai_a_split.txt` 上输出：
+     - total loss
+     - full Mel L1
+     - missing-region Mel L1
+     - full PSNR
+     - missing-region PSNR
+     - SSIM
+
+8. `pyproject.toml`
+   - 新增 `scikit-image`，用于 `skimage.metrics.structural_similarity` 计算 SSIM。
+
+9. `README.md`
+   - 新增 “Stage 1: VIAI-A Audio-Only” 小节。
+   - 写入下载、audio-only 处理、audio-only split、训练 smoke test、完整训练和测试命令。
+
+### README 中记录的 VIAI-A 命令
+1. 下载 MUSICES raw videos：
+```bash
+UV_CACHE_DIR=/tmp/uv-cache uv run --extra local-cuda python main.py prepare-data -- download --json data/MUSICES.json --data-root data --skip-existing
+```
+
+2. 生成 audio-only 样本：
+```bash
+UV_CACHE_DIR=/tmp/uv-cache uv run --extra local-cuda python main.py prepare-viai-a -- --json data/MUSICES.json --data-root data --skip-existing
+```
+
+3. 本地 smoke test：
+```bash
+UV_CACHE_DIR=/tmp/uv-cache uv run --extra local-cuda python main.py prepare-viai-a -- --json data/MUSICES.json --data-root data --max-videos 100 --skip-existing
+UV_CACHE_DIR=/tmp/uv-cache uv run --extra local-cuda python main.py split-data -- --data-root data --audio-only --max-samples 1 --test-size 0 --val-size 0 --allow-empty-eval
+UV_CACHE_DIR=/tmp/uv-cache uv run --extra local-cuda python main.py train-viai-a -- --batch_size 1 --num_workers 0 --max_train_steps 1 --display_id 0
+```
+
+4. 完整 audio-only split / train / test：
+```bash
+UV_CACHE_DIR=/tmp/uv-cache uv run --extra local-cuda python main.py split-data -- --data-root data --audio-only
+UV_CACHE_DIR=/tmp/uv-cache uv run --extra local-cuda python main.py train-viai-a -- --batch_size 16 --num_workers 4 --display_id 0
+UV_CACHE_DIR=/tmp/uv-cache uv run --extra local-cuda python main.py test-viai-a -- --resume_path checkpoints/VIAI-A_checkpoint_step000001000.pth.tar --batch_size 16 --num_workers 4 --display_id 0
+```
+
+### 后续验证计划
+1. 静态检查：
+```bash
+.venv/bin/python -m py_compile main.py tools/prepare_viai_a.py tools/split_musices.py train_viai_a.py test_viai_a.py Models/VIAI_A_inpainting.py Data_loaders/viai_a_loader.py
+```
+
+2. 数据准备 smoke test：
+```bash
+.venv/bin/python main.py prepare-viai-a -- --json data/MUSICES.json --data-root data --max-videos 100 --skip-existing
+.venv/bin/python main.py split-data -- --data-root data --audio-only --max-samples 1 --test-size 0 --val-size 0 --allow-empty-eval
+```
+
+3. 训练 smoke test：
+```bash
+.venv/bin/python main.py train-viai-a -- --batch_size 1 --num_workers 0 --max_train_steps 1 --display_id 0
+```
+
+4. 测试 smoke test：
+```bash
+.venv/bin/python main.py test-viai-a -- --resume_path ./checkpoints/VIAI-A_checkpoint_step000000001.pth.tar --test_split_name train_viai_a_split.txt --batch_size 1 --num_workers 0 --display_id 0
+```
+
+### 本次实际验证结果
+已通过静态检查：
+```bash
+.venv/bin/python -m py_compile main.py tools/prepare_viai_a.py tools/split_musices.py train_viai_a.py test_viai_a.py Models/VIAI_A_inpainting.py Data_loaders/viai_a_loader.py
+```
+
+新入口 help 已通过：
+```bash
+.venv/bin/python main.py --help
+.venv/bin/python main.py prepare-viai-a -- --help
+.venv/bin/python main.py split-data -- --help
+```
+
+audio-only 数据准备 smoke test 已通过：
+```bash
+.venv/bin/python main.py prepare-viai-a -- --json data/MUSICES.json --data-root data --max-videos 4 --skip-existing
+```
+
+关键输出：
+```text
+[prepare_viai_a] skipped existing: accordion/yy2vL2RUiPI -> data/processed/accordion/yy2vL2RUiPI
+[prepare_viai_a] processed: accordion/A2p8VW61RGc mel_frames=4517 -> data/processed/accordion/A2p8VW61RGc
+[prepare_viai_a] summary: missing=2, processed=1, skipped_existing=1
+```
+
+audio-only split smoke test 已通过：
+```bash
+.venv/bin/python main.py split-data -- --data-root data --audio-only --max-samples 1 --test-size 0 --val-size 0 --allow-empty-eval
+```
+
+关键输出：
+```text
+[split_musices] wrote splits: train=1 samples/1 videos (data/train_viai_a_split.txt), val=0 samples/0 videos (data/val_viai_a_split.txt), test=0 samples/0 videos (data/test_viai_a_split.txt)
+```
+
+VIAI-A 训练 smoke test 已通过：
+```bash
+.venv/bin/python main.py train-viai-a -- --batch_size 1 --num_workers 0 --max_train_steps 1 --display_id 0
+```
+
+关键输出：
+```text
+Reached VIAI-A smoke-test max_train_steps=1
+[VIAI-A train] loss=0.591076 full_l1=0.288049 missing_l1=0.303027
+Saved VIAI-A checkpoint: ./checkpoints/VIAI-A_checkpoint_step000000001.pth.tar
+Finished VIAI-A training
+```
+
+VIAI-A 测试 smoke test 已通过。由于 smoke split 的 `test_viai_a_split.txt` 为空，本次临时使用 `train_viai_a_split.txt` 验证测试路径：
+```bash
+.venv/bin/python main.py test-viai-a -- --resume_path ./checkpoints/VIAI-A_checkpoint_step000000001.pth.tar --test_split_name train_viai_a_split.txt --batch_size 1 --num_workers 0 --display_id 0
+```
+
+关键输出：
+```text
+[VIAI-A test] samples=1 loss=0.320611 mel_l1_full=0.152091 mel_l1_missing=0.168520 psnr_full=14.181 psnr_missing=13.249 ssim=0.0129
+```
+
+依赖锁更新已通过：
+```bash
+UV_CACHE_DIR=/tmp/uv-cache uv lock
+```
+
+关键输出：
+```text
+Added scikit-image v0.25.2, v0.26.0
+```
+
+## 2026-05-02 VIAI-A 训练实时监督增强
+
+### 修改内容
+1. 新增 `utils/viai_a_metrics.py`：
+   - 抽出 VIAI-A normalized Mel `[0, 1]` 指标计算。
+   - 统一计算 full PSNR、missing-region PSNR、SSIM。
+   - 保留 `skimage.metrics.structural_similarity` 缺失时的 SSIM fallback。
+   - 提供 TensorBoard Mel 图像写入工具：masked input、prediction、target、abs error。
+   - 如果当前环境缺少 `Pillow`，Mel 图像写入会给出一次 warning，但不打断训练。
+2. `base_options.py`
+   - 新增 `--metric_freq`，默认 100，用于训练阶段间隔计算 SSIM。
+   - 新增 `--tb_image_freq`，默认 500，用于间隔写入 Mel 对比图。
+   - 新增 `--tb_image_count`，默认 4，限制每次写入 TensorBoard 的样本数量。
+3. `train_viai_a.py`
+   - `tqdm` 实时显示 loss、full/missing PSNR、mask blank length，并在间隔 step 显示 SSIM。
+   - TensorBoard 继续写入 loss，同时新增 PSNR、SSIM、blank frames、learning rate。
+   - 训练按 `--tb_image_freq` 写入 Mel 对比图；验证每轮第一批写入一组 Mel 对比图。
+4. `test_viai_a.py`
+   - 删除本地重复 PSNR/SSIM 实现，改用 `utils.viai_a_metrics`。
+   - 保持原输出字段兼容：`mel_l1_full`、`mel_l1_missing`、`psnr_full`、`psnr_missing`、`ssim`。
+5. `README.md`
+   - VIAI-A 训练章节新增 TensorBoard 启动命令。
+   - 记录 `--metric_freq`、`--tb_image_freq`、`--tb_image_count` 常用监督参数。
+6. `pyproject.toml`
+   - 新增 `pillow` 依赖；`tensorboardX` 写 image panel 时需要 `PIL`。
+   - 新增 `tensorboard` 依赖；提供 `tensorboard --logdir` CLI 和 event tag 检查工具。
+
+### 验证命令
+```bash
+python -m py_compile train_viai_a.py test_viai_a.py utils/viai_a_metrics.py
+python main.py train-viai-a -- --data_root data --batch_size 1 --num_workers 0 --max_train_steps 1 --display_id 0
+tensorboard --logdir checkpoints/events_viai_a
+python main.py test-viai-a -- --resume_path ./checkpoints/VIAI-A_checkpoint_step000000001.pth.tar --test_split_name train_viai_a_split.txt --batch_size 1 --num_workers 0 --display_id 0
+```
+
+### 待记录 smoke test 关键输出
+```text
+[VIAI-A train] step=... loss=... full_l1=... missing_l1=... psnr=... psnr_missing=... ssim=...
+TensorBoard event log path: ./checkpoints/events_viai_a
+[VIAI-A test] samples=... loss=... mel_l1_full=... mel_l1_missing=... psnr_full=... psnr_missing=... ssim=...
+```
+
+### 本次实际验证结果
+静态检查已通过：
+```bash
+.venv/bin/python -m py_compile train_viai_a.py test_viai_a.py utils/viai_a_metrics.py
+```
+
+依赖锁和本地环境同步已通过：
+```bash
+UV_CACHE_DIR=/tmp/uv-cache uv lock
+UV_CACHE_DIR=/tmp/uv-cache uv sync --extra local-cuda
+```
+
+VIAI-A 训练 smoke test 已通过：
+```bash
+.venv/bin/python main.py train-viai-a -- --data_root data --batch_size 1 --num_workers 0 --max_train_steps 1 --display_id 0
+```
+
+关键输出：
+```text
+[VIAI-A train] epoch=1 ... loss=0.5728 ... psnr=9.11 psnr_miss=9.31 ssim=-0.0016 step=1
+Reached VIAI-A smoke-test max_train_steps=1
+[VIAI-A train] loss=0.572797 full_l1=0.292290 missing_l1=0.280507 psnr=9.112 psnr_missing=9.310 ssim=-0.001626
+Saved VIAI-A checkpoint: ./checkpoints/VIAI-A_checkpoint_step000000001.pth.tar
+Finished VIAI-A training
+```
+
+TensorBoard event tag 检查已通过：
+```text
+scalars ['train/blank_frames', 'train/loss_full_l1', 'train/loss_missing_l1', 'train/loss_total', 'train/lr', 'train/psnr_full', 'train/psnr_missing', 'train/ssim_full']
+images ['train/mel_abs_error', 'train/mel_input_masked', 'train/mel_prediction', 'train/mel_target']
+```
+
+TensorBoard CLI 可用：
+```bash
+.venv/bin/tensorboard --version
+```
+
+关键输出：
+```text
+2.20.0
+```
+
+VIAI-A 测试入口已通过：
+```bash
+.venv/bin/python main.py test-viai-a -- --data_root data --resume_path ./checkpoints/VIAI-A_checkpoint_step000000001.pth.tar --test_split_name train_viai_a_split.txt --batch_size 1 --num_workers 0 --display_id 0
+```
+
+关键输出：
+```text
+[VIAI-A test] samples=1 loss=0.356585 mel_l1_full=0.163478 mel_l1_missing=0.193108 psnr_full=13.548 psnr_missing=12.252 ssim=0.1417
+```

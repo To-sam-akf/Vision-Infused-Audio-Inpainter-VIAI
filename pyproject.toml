@@ -10,7 +10,11 @@ dependencies = [
     "nnmnkwii",
     "numpy",
     "opencv-contrib-python",
+    "pillow",
+    "scikit-image",
+    "tensorboard",
     "tensorboardX",
+    "tqdm",
     "yt-dlp[default]",
 ]
 

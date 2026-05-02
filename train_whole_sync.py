@@ -1,12 +1,14 @@
 import sys
 import os
 from os.path import dirname, join, expanduser
-import matplotlib
 from visdom_utils.visualizer import Visualizer
 from tqdm import tqdm  # , trange
 from datetime import datetime
-import matplotlib
-matplotlib.use('Agg')
+try:
+    import matplotlib
+    matplotlib.use('Agg')
+except ModuleNotFoundError:
+    matplotlib = None
 import Models.Whole_Sync_inpainting_modify as Audio_model
 import torch
 from utils import util

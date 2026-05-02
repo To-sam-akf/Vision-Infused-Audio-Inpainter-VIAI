@@ -12,12 +12,15 @@ from sklearn.model_selection import train_test_split
 import cv2
 from wavenet_vocoder.util import is_mulaw_quantize, is_mulaw, is_raw, is_scalar_input
 import numpy as np
-from utils import audio
 import Options_inpainting
 
 hparams = Options_inpainting.Inpainting_Config()
 
 fs = hparams.sample_rate
+
+
+def get_hop_size():
+    return hparams.hop_size
 
 
 def _pad(seq, max_len, constant_values=0):
@@ -48,12 +51,13 @@ def ensure_divisible(length, divisible_by=256, lower=True):
 
 
 def assert_ready_for_upsampling(x, c):
-    assert len(x) % len(c) == 0 and len(x) // len(c) == audio.get_hop_size()
+    assert len(x) % len(c) == 0 and len(x) // len(c) == get_hop_size()
 
 
 class _NPYDataSource(FileDataSource):
     def __init__(self, data_root, col, speaker_id=None,
-                 train=True, test_size=0.05, test_num_samples=None, random_state=1234):
+                 train=True, test_size=0.05, test_num_samples=None, random_state=1234,
+                 phase=None, split_name=None):
         self.data_root = data_root
         self.col = col
         self.lengths = []
@@ -64,16 +68,18 @@ class _NPYDataSource(FileDataSource):
         self.test_size = test_size
         self.test_num_samples = test_num_samples
         self.random_state = random_state
+        self.phase = phase if phase is not None else ("train" if train else "test")
+        self.split_name = split_name
 
 
     def collect_files(self):
-        if self.train:
-            metadata = "train" + hparams.new_split_name
-        else:
-            metadata = "test" + hparams.new_split_name
+        metadata = self.split_name if self.split_name is not None else self.phase + hparams.new_split_name
         meta = join(self.data_root, metadata)
         with open(meta, "rb") as f:
-            lines = f.readlines()
+            lines = [line for line in f.readlines() if line.strip()]
+        if not lines:
+            self.lengths = []
+            return []
         l = lines[0].decode("utf-8").split("|")
         assert len(l) == 4 or len(l) == 5
         self.multi_speaker = len(l) == 5
@@ -119,7 +125,8 @@ class _NPYDataSource(FileDataSource):
 
 class ImageDataSource(FileDataSource):
     def __init__(self, data_root, col, speaker_id=None,
-                 train=True, test_size=0.05, test_num_samples=None, random_state=1234):
+                 train=True, test_size=0.05, test_num_samples=None, random_state=1234,
+                 phase=None, split_name=None):
         self.data_root = data_root
         self.col = col
         self.lengths = []
@@ -130,15 +137,17 @@ class ImageDataSource(FileDataSource):
         self.test_size = test_size
         self.test_num_samples = test_num_samples
         self.random_state = random_state
+        self.phase = phase if phase is not None else ("train" if train else "test")
+        self.split_name = split_name
 
     def collect_files(self):
-        if self.train:
-            metadata = "train" + hparams.new_split_name
-        else:
-            metadata = "test" + hparams.new_split_name
+        metadata = self.split_name if self.split_name is not None else self.phase + hparams.new_split_name
         meta = join(self.data_root, metadata)
         with open(meta, "rb") as f:
-            lines = f.readlines()
+            lines = [line for line in f.readlines() if line.strip()]
+        if not lines:
+            self.lengths = []
+            return []
         l = lines[0].decode("utf-8").split("|")
         assert len(l) == 4 or len(l) == 5
         self.multi_speaker = len(l) == 5
@@ -171,25 +180,31 @@ def sample_data_new(data_path, train=True, hparams=hparams):
     num_images = len_flows
     max_time_second = max_time_steps / hparams.sample_rate
 
-    use_image_num = int(np.floor(max_time_second / (0.04 * hparams.image_hope_size)))
-    image_start = np.random.randint(25, num_images - use_image_num - 25 + 1)
+    frame_stride = max(1, int(hparams.image_hope_size))
+    use_image_num = int(np.floor(max_time_second / (0.04 * frame_stride)))
+    if use_image_num <= 0:
+        raise ValueError("use_image_num must be positive; check max_time_steps and image_hope_size")
+
+    last_offset = (use_image_num - 1) * frame_stride
+    min_start = 25
+    max_start = num_images - 1 - last_offset - 25
+    if max_start < min_start:
+        min_start = 0
+        max_start = num_images - 1 - last_offset
+    if max_start < min_start:
+        raise ValueError(
+            f"Not enough video frames in {data_path}: need {last_offset + 1}, found {num_images}"
+        )
+    start_candidates = np.arange(min_start, max_start + 1)
+    image_start = int(np.random.choice(start_candidates))
 
     # assert hparams.load_num > 0
     start = []
     start.append(image_start)
     for ln in range(1, hparams.load_num):
-        random1 = np.random.randint(0, image_start - 25 + 1)
-        random2 = np.random.randint(image_start + 25, num_images - use_image_num + 1)
-        if np.random.randint(0, 2) == 1:
-            if random1 - start[-1] > 10:
-                start.append(random1)
-            else:
-                start.append(random2)
-        else:
-            if random2 - start[-1] > 10:
-                start.append(random2)
-            else:
-                start.append(random1)
+        separated = [candidate for candidate in start_candidates if all(abs(candidate - used) > 10 for used in start)]
+        candidates = separated if separated else start_candidates
+        start.append(int(np.random.choice(candidates)))
     image_rescal_size = hparams.image_rescal_size
     image_size = hparams.image_size
     if train:
@@ -197,8 +212,8 @@ def sample_data_new(data_path, train=True, hparams=hparams):
                 (hparams.load_num, use_image_num, hparams.image_rescal_size, hparams.image_rescal_size, 3))
         flow_block = np.zeros(
                 (hparams.load_num, use_image_num, hparams.image_rescal_size, hparams.image_rescal_size, 2))
-        crop_x = np.random.randint(0, image_rescal_size - image_size)
-        crop_y = np.random.randint(0, image_rescal_size - image_size)
+        crop_x = np.random.randint(0, image_rescal_size - image_size) if image_rescal_size > image_size else 0
+        crop_y = np.random.randint(0, image_rescal_size - image_size) if image_rescal_size > image_size else 0
         flip = np.random.randint(0, 2)
     else:
         video_block = np.zeros(
@@ -210,7 +225,7 @@ def sample_data_new(data_path, train=True, hparams=hparams):
     if hparams.image or hparams.flow:
         for ln in range(hparams.load_num):
             i = 0
-            for item in range(start[ln], use_image_num + start[ln]):
+            for item in range(start[ln], start[ln] + use_image_num * frame_stride, frame_stride):
                 flow_x_path = os.path.join(flow_x_crop_path, str(item + 1) + '.jpg')
                 flow_y_path = os.path.join(flow_y_crop_path, str(item + 1) + '.jpg')
                 image_path = os.path.join(image_crop_path, str(item + 1) + '.jpg')
@@ -266,8 +281,8 @@ def load_image(path, train, hparams=hparams):
                 (len_flows, hparams.image_rescal_size, hparams.image_rescal_size, 3))
         flow_block = np.zeros(
                 (len_flows,  hparams.image_rescal_size, hparams.image_rescal_size, 2))
-        crop_x = np.random.randint(0, image_rescal_size - image_size)
-        crop_y = np.random.randint(0, image_rescal_size - image_size)
+        crop_x = np.random.randint(0, image_rescal_size - image_size) if image_rescal_size > image_size else 0
+        crop_y = np.random.randint(0, image_rescal_size - image_size) if image_rescal_size > image_size else 0
         flip = np.random.randint(0, 2)
     else:
         video_block = np.zeros(
@@ -462,7 +477,11 @@ def collate_fn(batch):
         max_time_steps = None
     max_time_second = max_time_steps / hparams.sample_rate
 
-    use_image_num = int(np.floor(max_time_second / (0.04 * hparams.image_hope_size)))
+    frame_stride = max(1, int(hparams.image_hope_size))
+    use_image_num = int(np.floor(max_time_second / (0.04 * frame_stride)))
+    mel_frames_per_raw_video_frame = 0.04 * hparams.sample_rate / hparams.hop_size
+    mel_window_frames = int(round(use_image_num * frame_stride * mel_frames_per_raw_video_frame))
+    audio_window_steps = mel_window_frames * hparams.hop_size
     # Time resolution adjustment
     video_block = []
     flow_block = []
@@ -473,17 +492,32 @@ def collate_fn(batch):
             if hparams.upsample_conditional_features:
                 assert_ready_for_upsampling(x, c)
                 if max_time_steps is not None:
-                    max_steps = ensure_divisible(max_time_steps, audio.get_hop_size(), True)
-                    if len(x) > max_steps:
+                    max_steps = ensure_divisible(max_time_steps, get_hop_size(), True)
+                    if len(x) < max_steps:
+                        raise ValueError(
+                            f"Sample is shorter than the configured audio window: {path}, "
+                            f"audio_steps={len(x)}, required={max_steps}"
+                        )
 
-                        for ln in range(hparams.load_num):
-                            mel_start = 3 + 4 * start[ln]
-                            c1 = c[mel_start:mel_start + use_image_num * 4]
-                            x1 = x[mel_start * hparams.hop_size : (mel_start + use_image_num * 4) * hparams.hop_size]
-                            new_batch.append((x1, c1, g, os.path.join(path, str(start[ln]))))
-                        video_block.append(torch.FloatTensor(video))
-                        flow_block.append(torch.FloatTensor(flow))
+                    for ln in range(hparams.load_num):
+                        mel_start = int(round(start[ln] * mel_frames_per_raw_video_frame))
+                        mel_end = mel_start + mel_window_frames
+                        audio_start = mel_start * hparams.hop_size
+                        audio_end = audio_start + audio_window_steps
+                        if mel_end > len(c) or audio_end > len(x):
+                            raise ValueError(
+                                f"Video/audio alignment exceeds sample length: {path}, "
+                                f"mel={mel_start}:{mel_end}/{len(c)}, "
+                                f"audio={audio_start}:{audio_end}/{len(x)}"
+                            )
+                        c1 = c[mel_start:mel_end]
+                        x1 = x[audio_start:audio_end]
+                        new_batch.append((x1, c1, g, os.path.join(path, str(start[ln]))))
+                    video_block.append(torch.FloatTensor(video))
+                    flow_block.append(torch.FloatTensor(flow))
         batch = new_batch
+    if not batch:
+        raise ValueError("No valid samples remained after audio/video window alignment")
 
     # Lengths
     input_lengths = [len(x[0]) for x in batch]
@@ -542,21 +576,51 @@ def collate_fn(batch):
 
 
 
-def get_data_loaders(data_root, speaker_id=None, test_shuffle=True):
+def split_name_for_phase(phase):
+    if phase == "train":
+        return hparams.train_split_name
+    if phase == "val":
+        return hparams.val_split_name
+    if phase == "test":
+        return hparams.test_split_name
+    raise ValueError(f"Unknown data phase: {phase}")
+
+
+def split_has_rows(data_root, split_name):
+    split_path = os.path.join(data_root, split_name)
+    if not os.path.exists(split_path):
+        return False
+    with open(split_path, "r", encoding="utf-8") as handle:
+        return any(line.strip() for line in handle)
+
+
+def get_data_loaders(data_root, speaker_id=None, test_shuffle=True, phases=("train", "val")):
     data_loaders = {}
     local_conditioning = hparams.cin_channels > 0
-    for phase in ["train", "test"]:
+    for phase in phases:
         train = phase == "train"
+        split_name = split_name_for_phase(phase)
+        if not split_has_rows(data_root, split_name):
+            if train:
+                raise RuntimeError(f"Training split is missing or empty: {os.path.join(data_root, split_name)}")
+            print(f"[{phase}]: split missing or empty, skipping {split_name}")
+            continue
         X = FileSourceDataset(RawAudioDataSource(data_root, speaker_id=speaker_id,
                                                  train=train,
-                                                 test_size=hparams.test_size))
+                                                 test_size=hparams.test_size,
+                                                 phase=phase,
+                                                 split_name=split_name))
         Image = FileSourceDataset(ImageSpecDataSource(data_root, speaker_id=speaker_id,
                                                       train=train,
-                                                      test_size=hparams.test_size))
+                                                      test_size=hparams.test_size,
+                                                      phase=phase,
+                                                      split_name=split_name))
         if local_conditioning:
             Mel = FileSourceDataset(MelSpecDataSource(data_root, speaker_id=speaker_id,
                                                       train=train,
-                                                      test_size=hparams.test_size))
+                                                      test_size=hparams.test_size,
+                                                      phase=phase,
+                                                      split_name=split_name))
             assert len(X) == len(Mel)
             print("Local conditioning enabled. Shape of a sample: {}.".format(
                 Mel[0].shape))

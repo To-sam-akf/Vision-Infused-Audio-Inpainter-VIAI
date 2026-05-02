@@ -3,7 +3,6 @@ import os
 import ntpath
 import time
 from utils import util
-from . import html
 import Options_inpainting
 opt = Options_inpainting.Inpainting_Config()
 

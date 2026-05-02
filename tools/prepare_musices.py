@@ -68,8 +68,8 @@ def parse_args():
         choices=["manifest", "stats", "download", "process", "splits", "all"],
         help="Preparation stage to run.",
     )
-    parser.add_argument("--json", dest="json_path", default="data/MUSICES.json")
-    parser.add_argument("--data-root", default="data")
+    parser.add_argument("--json", dest="json_path", default="/root/shared-nvme/data/MUSICES.json")
+    parser.add_argument("--data-root", default="/root/shared-nvme/data")
     parser.add_argument("--video-dir", default="raw_videos")
     parser.add_argument(
         "--video-root",
@@ -97,6 +97,55 @@ def parse_args():
     parser.add_argument("--ref-level-db", type=float, default=20.0)
     parser.add_argument("--frame-size", type=int, default=256)
     parser.add_argument("--frame-stride", type=int, default=1)
+    parser.add_argument(
+        "--trim-start-sec",
+        type=float,
+        default=6.0,
+        help="Trim this many seconds from the start of each video. The VIAI paper removes the first 6 seconds.",
+    )
+    parser.add_argument(
+        "--min-segment-sec",
+        type=float,
+        default=4.0,
+        help="Minimum usable segment duration. VIAI trains on 4-second windows.",
+    )
+    parser.add_argument(
+        "--shot-detection",
+        dest="shot_detection",
+        action="store_true",
+        default=True,
+        help="Split each video into shot-like segments before feature extraction.",
+    )
+    parser.add_argument(
+        "--no-shot-detection",
+        dest="shot_detection",
+        action="store_false",
+        help="Process each video as one sample. Use with --trim-start-sec 0 for legacy behavior.",
+    )
+    parser.add_argument(
+        "--shot-diff-threshold",
+        type=float,
+        default=35.0,
+        help="Mean grayscale frame-difference threshold used by the OpenCV shot detector.",
+    )
+    parser.add_argument(
+        "--black-frame-threshold",
+        type=float,
+        default=10.0,
+        help="Mean grayscale value below which a frame is counted as black.",
+    )
+    parser.add_argument(
+        "--max-black-ratio",
+        type=float,
+        default=0.5,
+        help="Skip segments whose sampled frames are black at or above this ratio.",
+    )
+    parser.add_argument(
+        "--min-audio-rms",
+        type=float,
+        default=0.005,
+        help="Skip segments whose audio RMS is below this threshold.",
+    )
     parser.add_argument(
         "--flow-method",
         choices=["tvl1", "farneback"],
@@ -226,6 +275,12 @@ def video_output_path(data_root, video_dir, record, video_root=None):
 
 def sample_output_dir(data_root, processed_dir, record):
     return Path(data_root) / processed_dir / record["instrument"] / record["youtube_id"]
+
+
+def segment_output_dir(data_root, processed_dir, record, segment_id):
+    if segment_id is None:
+        return sample_output_dir(data_root, processed_dir, record)
+    return sample_output_dir(data_root, processed_dir, record) / f"shot_{segment_id:06d}"
 
 
 def video_url(record):
@@ -815,6 +870,113 @@ def export_audio_and_mel(sample_dir, wav_path, args):
     return mel.shape[0]
 
 
+def audio_rms(wav_path, args):
+    np = require_numpy()
+    librosa = require_librosa()
+    wav, _ = librosa.load(str(wav_path), sr=args.sample_rate, mono=True)
+    if wav.size == 0:
+        return 0.0
+    return float(np.sqrt(np.mean(np.square(wav))))
+
+
+def reset_directory(path):
+    path = Path(path)
+    if path.exists():
+        shutil.rmtree(path)
+    ensure_dir(path)
+
+
+def video_duration_and_fps(video_path):
+    cv2 = require_cv2()
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise RuntimeError(f"Unable to open video: {video_path}")
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+    cap.release()
+    if fps is None or fps <= 0:
+        fps = 25.0
+    duration = frame_count / fps if frame_count and frame_count > 0 else 0.0
+    return float(duration), float(fps)
+
+
+def detect_video_segments(video_path, args):
+    cv2 = require_cv2()
+    np = require_numpy()
+    duration, fps = video_duration_and_fps(video_path)
+    start_sec = min(max(args.trim_start_sec, 0.0), duration)
+    if duration - start_sec < args.min_segment_sec:
+        return []
+    if not args.shot_detection:
+        return [(start_sec, duration - start_sec)]
+
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise RuntimeError(f"Unable to open video: {video_path}")
+
+    start_frame = int(round(start_sec * fps))
+    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+    previous_gray = None
+    segment_start = start_sec
+    segments = []
+    frame_index = start_frame
+
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        timestamp = frame_index / fps
+        if timestamp >= duration:
+            break
+        gray = cv2.cvtColor(cv2.resize(frame, (64, 64)), cv2.COLOR_BGR2GRAY)
+        if previous_gray is not None:
+            diff = float(np.mean(np.abs(gray.astype(np.float32) - previous_gray.astype(np.float32))))
+            if diff >= args.shot_diff_threshold:
+                if timestamp - segment_start >= args.min_segment_sec:
+                    segments.append((segment_start, timestamp - segment_start))
+                segment_start = timestamp
+        previous_gray = gray
+        frame_index += 1
+
+    cap.release()
+    if duration - segment_start >= args.min_segment_sec:
+        segments.append((segment_start, duration - segment_start))
+    return segments
+
+
+def black_frame_ratio(video_path, start_sec, duration_sec, args, sample_stride_frames=25):
+    cv2 = require_cv2()
+    np = require_numpy()
+    _, fps = video_duration_and_fps(video_path)
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise RuntimeError(f"Unable to open video: {video_path}")
+
+    start_frame = int(round(start_sec * fps))
+    end_frame = int(round((start_sec + duration_sec) * fps))
+    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+    frame_index = start_frame
+    sampled = 0
+    black = 0
+    stride = max(1, sample_stride_frames)
+
+    while frame_index < end_frame:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        if (frame_index - start_frame) % stride == 0:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            sampled += 1
+            if float(np.mean(gray)) <= args.black_frame_threshold:
+                black += 1
+        frame_index += 1
+
+    cap.release()
+    if sampled == 0:
+        return 1.0
+    return black / sampled
+
+
 def normalize_flow_component(component, flow_clip):
     np = require_numpy()
     scaled = np.clip(component, -flow_clip, flow_clip)
@@ -851,32 +1013,52 @@ def compute_optical_flow(cv2, previous_gray, gray, flow_method, tvl1_estimator):
     )
 
 
-def extract_frames_and_flow(video_path, sample_dir, frame_size, frame_stride, flow_clip, flow_method):
+def extract_frames_and_flow(
+    video_path,
+    sample_dir,
+    frame_size,
+    frame_stride,
+    flow_clip,
+    flow_method,
+    start_sec=0.0,
+    duration_sec=None,
+):
     cv2 = require_cv2()
     np = require_numpy()
     image_dir = sample_dir / "image"
     flow_x_dir = sample_dir / "flow_x"
     flow_y_dir = sample_dir / "flow_y"
     for directory in [image_dir, flow_x_dir, flow_y_dir]:
-        ensure_dir(directory)
+        reset_directory(directory)
 
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise RuntimeError(f"Unable to open video: {video_path}")
 
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if fps is None or fps <= 0:
+        fps = 25.0
+    start_frame = int(round(max(start_sec, 0.0) * fps))
+    end_frame = None
+    if duration_sec is not None:
+        end_frame = int(round((max(start_sec, 0.0) + duration_sec) * fps))
+    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+
     frames = []
-    index = 0
+    frame_index = start_frame
     while True:
+        if end_frame is not None and frame_index >= end_frame:
+            break
         ok, frame = cap.read()
         if not ok:
             break
-        if index % max(frame_stride, 1) == 0:
+        if (frame_index - start_frame) % max(frame_stride, 1) == 0:
             frames.append(cv2.resize(frame, (frame_size, frame_size)))
-        index += 1
+        frame_index += 1
     cap.release()
 
     if len(frames) < 2:
-        raise RuntimeError(f"Video too short to extract optical flow: {video_path}")
+        raise RuntimeError(f"Video segment too short to extract optical flow: {video_path}")
 
     previous_gray = None
     zero_flow = np.full((frame_size, frame_size), 127, dtype=np.uint8)
@@ -975,7 +1157,7 @@ def crop_motion_region(sample_dir):
     flow_x_crop_dir = sample_dir / "flow_x_crop"
     flow_y_crop_dir = sample_dir / "flow_y_crop"
     for directory in [image_crop_dir, flow_x_crop_dir, flow_y_crop_dir]:
-        ensure_dir(directory)
+        reset_directory(directory)
 
     bounds = compute_crop_bounds(sample_dir)
     image_paths = sorted((sample_dir / "image").glob("*.jpg"), key=lambda path: int(path.stem))
@@ -1003,13 +1185,19 @@ def crop_motion_region(sample_dir):
         cv2.imwrite(str(flow_y_crop_dir / f"{frame_id}.jpg"), flow_y)
 
 
-def extract_audio_from_video(video_path, wav_path, ffmpeg_binary, skip_existing):
+def extract_audio_from_video(video_path, wav_path, ffmpeg_binary, skip_existing, start_sec=0.0, duration_sec=None):
     ensure_dir(wav_path.parent)
     if skip_existing and wav_path.exists():
         return wav_path
     command = [
         ffmpeg_binary,
         "-y",
+        "-ss",
+        str(max(start_sec, 0.0)),
+    ]
+    if duration_sec is not None:
+        command.extend(["-t", str(duration_sec)])
+    command.extend([
         "-i",
         str(video_path),
         "-ac",
@@ -1017,7 +1205,7 @@ def extract_audio_from_video(video_path, wav_path, ffmpeg_binary, skip_existing)
         "-ar",
         "16000",
         str(wav_path),
-    ]
+    ])
     subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return wav_path
 
@@ -1035,10 +1223,29 @@ def processed_sample_ready(sample_dir):
     return all(path.exists() for path in required_files) and all(path.exists() for path in required_dirs)
 
 
-def process_record(record, args, ffmpeg_binary):
+def clean_legacy_flat_sample(sample_dir):
+    for name in [
+        "source.wav",
+        "raw_audio.npy",
+        "mel.npy",
+        "image",
+        "flow_x",
+        "flow_y",
+        "image_crop",
+        "flow_x_crop",
+        "flow_y_crop",
+    ]:
+        path = sample_dir / name
+        if path.is_dir():
+            shutil.rmtree(path)
+        elif path.exists():
+            path.unlink()
+
+
+def process_segment(record, args, ffmpeg_binary, segment_id, start_sec, duration_sec):
     data_root = Path(args.data_root)
     video_path = video_output_path(data_root, args.video_dir, record, args.video_root)
-    sample_dir = sample_output_dir(data_root, args.processed_dir, record)
+    sample_dir = segment_output_dir(data_root, args.processed_dir, record, segment_id)
 
     if args.skip_existing and processed_sample_ready(sample_dir):
         return {
@@ -1049,7 +1256,32 @@ def process_record(record, args, ffmpeg_binary):
 
     ensure_dir(sample_dir)
     wav_path = sample_dir / "source.wav"
-    extract_audio_from_video(video_path, wav_path, ffmpeg_binary, args.skip_existing)
+    extract_audio_from_video(
+        video_path,
+        wav_path,
+        ffmpeg_binary,
+        args.skip_existing,
+        start_sec=start_sec,
+        duration_sec=duration_sec,
+    )
+    rms = audio_rms(wav_path, args)
+    if rms < args.min_audio_rms:
+        shutil.rmtree(sample_dir)
+        return {
+            "sample_dir": sample_dir,
+            "mel_frames": None,
+            "status": "skipped_silent",
+        }
+
+    black_ratio = black_frame_ratio(video_path, start_sec, duration_sec, args)
+    if black_ratio >= args.max_black_ratio:
+        shutil.rmtree(sample_dir)
+        return {
+            "sample_dir": sample_dir,
+            "mel_frames": None,
+            "status": "skipped_black",
+        }
+
     extract_frames_and_flow(
         video_path=video_path,
         sample_dir=sample_dir,
@@ -1057,6 +1289,8 @@ def process_record(record, args, ffmpeg_binary):
         frame_stride=args.frame_stride,
         flow_clip=args.flow_clip,
         flow_method=args.flow_method,
+        start_sec=start_sec,
+        duration_sec=duration_sec,
     )
     crop_motion_region(sample_dir)
     mel_frames = export_audio_and_mel(sample_dir, wav_path, args)
@@ -1065,6 +1299,55 @@ def process_record(record, args, ffmpeg_binary):
         "mel_frames": mel_frames,
         "status": "processed",
     }
+
+
+def process_record(record, args, ffmpeg_binary):
+    data_root = Path(args.data_root)
+    video_path = video_output_path(data_root, args.video_dir, record, args.video_root)
+    root_sample_dir = sample_output_dir(data_root, args.processed_dir, record)
+    if args.shot_detection:
+        ensure_dir(root_sample_dir)
+        clean_legacy_flat_sample(root_sample_dir)
+
+    segments = detect_video_segments(video_path, args)
+    if not segments:
+        return {"status": "no_segments", "processed": 0, "skipped": 0}
+
+    processed = 0
+    skipped = 0
+    for segment_index, (start_sec, duration_sec) in enumerate(segments):
+        segment_id = segment_index if args.shot_detection else None
+        try:
+            result = process_segment(
+                record,
+                args,
+                ffmpeg_binary,
+                segment_id,
+                start_sec,
+                duration_sec,
+            )
+        except RuntimeError as exc:
+            skipped += 1
+            print(
+                f"[prepare_musices] segment skipped: {record['sample_key']} "
+                f"segment={segment_index} start={start_sec:.2f}s duration={duration_sec:.2f}s | {exc}"
+            )
+            continue
+
+        if result["status"] == "processed":
+            processed += 1
+            print(
+                f"[prepare_musices] segment processed: {record['sample_key']} "
+                f"segment={segment_index} start={start_sec:.2f}s duration={duration_sec:.2f}s "
+                f"mel_frames={result['mel_frames']}"
+            )
+        else:
+            skipped += 1
+            print(
+                f"[prepare_musices] segment {result['status']}: {record['sample_key']} "
+                f"segment={segment_index} start={start_sec:.2f}s duration={duration_sec:.2f}s"
+            )
+    return {"status": "processed" if processed else "no_valid_segments", "processed": processed, "skipped": skipped}
 
 
 def write_split_files(records, args):
@@ -1246,17 +1529,26 @@ def main():
                 continue
             print(f"[prepare_musices] processing {index}/{len(records)}: {record['sample_key']}")
             result = process_record(record, args, ffmpeg_binary)
-            if result["status"] == "skipped_existing":
-                print(f"[prepare_musices] process skipped existing: {record['sample_key']}")
+            print(
+                f"[prepare_musices] process summary: {record['sample_key']} | "
+                f"status={result['status']} processed={result['processed']} skipped={result['skipped']}"
+            )
         if args.action == "process":
             return
 
-    if args.action in {"splits", "all"}:
+    if args.action == "splits":
+        print(
+            "[prepare_musices] warning: the splits action is kept for legacy compatibility. "
+            "Use `python main.py split-data -- --data-root ...` for the paper-style "
+            "train/val/test split protocol."
+        )
         train_count, test_count = write_split_files(records, args)
         print(
             f"[prepare_musices] wrote split files: "
             f"{args.train_split_name} ({train_count}), {args.test_split_name} ({test_count})"
         )
+    elif args.action == "all":
+        print("[prepare_musices] processing complete. Run `python main.py split-data -- --data-root ...` next.")
 
 
 if __name__ == "__main__":
