@@ -5,10 +5,11 @@ import torch
 def build_missing_mask(batch_size, mel_bins, mel_steps, start, width, device):
     mask = torch.zeros(batch_size, 1, mel_bins, mel_steps, device=device)
     end = min(start + width, mel_steps)
+    # 生成mask
     mask[:, :, :, start:end] = 1.0
     return mask
 
-
+#  用左右边界插值填入缺失区域
 def interpolate_missing_region(mel_4d, start, width):
     end = min(start + width, mel_4d.size(-1))
     if end <= start:

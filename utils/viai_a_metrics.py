@@ -88,7 +88,23 @@ def mel_image_batches(mel_input, mel_pred, mel_target, max_items=4):
 
 def _mel_to_uint8_image(mel_2d):
     array = torch.clamp(mel_2d.detach().cpu(), 0.0, 1.0).numpy()
-    return (array * 255.0).round().astype(np.uint8)
+    anchors = np.array(
+        [
+            [0.0015, 0.0005, 0.0139],
+            [0.2515, 0.0380, 0.4034],
+            [0.5783, 0.1480, 0.4044],
+            [0.9023, 0.3645, 0.2711],
+            [0.9871, 0.9914, 0.7495],
+        ],
+        dtype=np.float32,
+    )
+    scaled = array * (len(anchors) - 1)
+    lower = np.floor(scaled).astype(np.int64)
+    upper = np.clip(lower + 1, 0, len(anchors) - 1)
+    lower = np.clip(lower, 0, len(anchors) - 1)
+    weight = (scaled - lower)[..., None]
+    rgb = anchors[lower] * (1.0 - weight) + anchors[upper] * weight
+    return (rgb * 255.0).round().astype(np.uint8)
 
 
 def save_mel_comparison_png(path, mel_input, mel_pred, mel_target):
@@ -106,14 +122,14 @@ def save_mel_comparison_png(path, mel_input, mel_pred, mel_target):
     panel_height = panels[0][1].shape[0]
     canvas_width = panel_width * len(panels) + gap * (len(panels) - 1)
     canvas_height = panel_height + label_height
-    canvas = Image.new("L", (canvas_width, canvas_height), color=255)
+    canvas = Image.new("RGB", (canvas_width, canvas_height), color=(255, 255, 255))
     draw = ImageDraw.Draw(canvas)
 
     x_offset = 0
     for label, array in panels:
-        panel = Image.fromarray(array, mode="L")
+        panel = Image.fromarray(array, mode="RGB")
         canvas.paste(panel, (x_offset, label_height))
-        draw.text((x_offset + 2, 2), label, fill=0)
+        draw.text((x_offset + 2, 2), label, fill=(0, 0, 0))
         x_offset += panel_width + gap
 
     canvas.save(path)

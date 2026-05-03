@@ -707,3 +707,46 @@ find checkpoints/viai_a_test_results/mel-image/step000000001 -maxdepth 1 -type f
 000000_processed_accordion_A2p8VW61RGc.png
 checkpoints/viai_a_test_results/mel-image/step000000001/000000_processed_accordion_A2p8VW61RGc.png
 ```
+
+## 2026-05-03 VIAI-A 测试 Mel PNG 改为 RGB 热力图
+
+### 修改内容
+1. `utils/viai_a_metrics.py`
+   - `_mel_to_uint8_image()` 从单通道灰度输出改为 `H x W x 3` RGB 输出。
+   - 使用内置 magma-like colormap，不新增 `matplotlib` 等依赖。
+   - `save_mel_comparison_png()` 改为 `Image.new("RGB", ...)` 和 `Image.fromarray(..., mode="RGB")`。
+2. `README.md`
+   - 明确 `mel-image/stepXXXXXXXXX/` 下保存的是 RGB 热力图四联图。
+
+### 验证命令
+```bash
+.venv/bin/python -m py_compile utils/viai_a_metrics.py test_viai_a.py
+.venv/bin/python main.py test-viai-a -- --data_root data --resume_path ./checkpoints/VIAI-A_checkpoint_step000000001.pth.tar --test_split_name train_viai_a_split.txt --batch_size 1 --num_workers 0 --display_id 0 --results_dir checkpoints/viai_a_test_results
+.venv/bin/python -c "from PIL import Image; import glob; p=glob.glob('checkpoints/viai_a_test_results/mel-image/step000000001/*.png')[0]; img=Image.open(p); print(img.mode, img.size)"
+```
+
+### 待记录 smoke test 关键输出
+```text
+RGB (...)
+```
+
+### 本次实际验证结果
+静态检查已通过：
+```bash
+.venv/bin/python -m py_compile utils/viai_a_metrics.py test_viai_a.py
+```
+
+VIAI-A 测试 smoke test 已通过：
+```bash
+.venv/bin/python main.py test-viai-a -- --data_root data --resume_path ./checkpoints/VIAI-A_checkpoint_step000000001.pth.tar --test_split_name train_viai_a_split.txt --batch_size 1 --num_workers 0 --display_id 0 --results_dir checkpoints/viai_a_test_results
+```
+
+PNG mode 检查已通过：
+```bash
+.venv/bin/python -c "from PIL import Image; import glob; p=glob.glob('checkpoints/viai_a_test_results/mel-image/step000000001/*.png')[0]; img=Image.open(p); print(img.mode, img.size, p)"
+```
+
+关键输出：
+```text
+RGB (812, 98) checkpoints/viai_a_test_results/mel-image/step000000001/000000_processed_accordion_A2p8VW61RGc.png
+```

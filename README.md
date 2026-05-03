@@ -12,6 +12,190 @@ We present a vision-infused method that can deal with both audio-only and audio-
 * [opencv-contrib-python](https://pypi.org/project/opencv-contrib-python/) for TV-L1 optical flow
 
 ### 第一阶段：VIAI-A Audio-Only
+是的：**train 和 test 过程都会对 Mel 使用 mask**。  
+准确地说，mask 不在 `viai_a_loader.py` 里做，而是在模型封装的 `VIAIAModel.set_inputs()` 里做，所以 train / val / test 只要调用 `model.set_inputs(data)`，都会执行同一套 Mel corruption/mask 逻辑。
+
+**核心结论**
+- `viai_a_loader.py`：只负责加载 `mel.npy`，裁出 80x200 Mel window。
+- `VIAIAModel.set_inputs()`：对 Mel 做随机缺失段 mask，并用边界插值填充 corrupted input。
+- `train_viai_a.py`：训练和验证都会调用 `set_inputs()`，所以都会 mask。
+- `test_viai_a.py`：测试也会调用 `set_inputs()`，所以 test 也会 mask。
+- 当前 mask 是“插值 mask”，不是黑色/零值 mask，所以 masked input 看起来会和 target 很像。
+
+**Train 调用链**
+1. 命令入口  
+   `python main.py train-viai-a ...`
+
+2. [main.py](/home/sanmu/Vision-Infused-Audio-Inpainter-VIAI/main.py:217)  
+   `MODULE_MAP["train-viai-a"] -> train_viai_a`
+
+3. [train_viai_a.py](/home/sanmu/Vision-Infused-Audio-Inpainter-VIAI/train_viai_a.py:223)  
+   `main()` 创建 dataloader 和 `VIAIAModel`
+
+4. [viai_a_loader.py](/home/sanmu/Vision-Infused-Audio-Inpainter-VIAI/Data_loaders/viai_a_loader.py:113)  
+   `get_data_loaders(..., phases=("train", "val"))`
+
+5. [viai_a_loader.py](/home/sanmu/Vision-Infused-Audio-Inpainter-VIAI/Data_loaders/viai_a_loader.py:89)  
+   `VIAIASplitDataset.__getitem__()`：
+   - 读取 `mel.npy`
+   - train 阶段随机裁 200 帧 Mel
+   - val 阶段取中间 200 帧 Mel
+   - 返回：
+     ```python
+     {
+       "mel": Tensor[80, 200],
+       "audio": Tensor[64000],
+       "path": sample_dir
+     }
+     ```
+
+6. [train_viai_a.py](/home/sanmu/Vision-Infused-Audio-Inpainter-VIAI/train_viai_a.py:70)  
+   `run_phase()`
+
+7. [train_viai_a.py](/home/sanmu/Vision-Infused-Audio-Inpainter-VIAI/train_viai_a.py:93)  
+   每个 batch 先随机缺失长度：
+   ```python
+   model.get_blank_space_length(global_step)
+   ```
+
+8. [train_viai_a.py](/home/sanmu/Vision-Infused-Audio-Inpainter-VIAI/train_viai_a.py:94)  
+   然后设置输入：
+   ```python
+   model.set_inputs(data)
+   ```
+
+9. [Models/VIAI_A_inpainting.py](/home/sanmu/Vision-Infused-Audio-Inpainter-VIAI/Models/VIAI_A_inpainting.py:120)  
+   `set_inputs()` 中真正执行 mask：
+   ```python
+   self.mel_input, self.missing_mask, self.missing_span = mel_loader.corrupt_mel_spectrogram(
+       self.mel_target,
+       self.blank_length,
+   )
+   ```
+
+10. [mel_loader.py](/home/sanmu/Vision-Infused-Audio-Inpainter-VIAI/Data_loaders/mel_loader.py:35)  
+    `corrupt_mel_spectrogram()`：
+    - 随机选择 `start`
+    - 生成 `missing_mask`
+    - 对缺失区域做插值替换
+
+11. [mel_loader.py](/home/sanmu/Vision-Infused-Audio-Inpainter-VIAI/Data_loaders/mel_loader.py:5)  
+    `build_missing_mask()` 生成 mask：
+    ```python
+    mask[:, :, :, start:end] = 1.0
+    ```
+
+12. [mel_loader.py](/home/sanmu/Vision-Infused-Audio-Inpainter-VIAI/Data_loaders/mel_loader.py:12)  
+    `interpolate_missing_region()` 用左右边界插值填入缺失区域：
+    ```python
+    mel_4d[:, :, :, start:end] = left * (1.0 - alpha) + right * alpha
+    ```
+
+13. [Models/VIAI_A_inpainting.py](/home/sanmu/Vision-Infused-Audio-Inpainter-VIAI/Models/VIAI_A_inpainting.py:148)  
+    train 阶段：
+    ```python
+    model.optimize_parameters(global_step)
+    ```
+
+14. [Models/VIAI_A_inpainting.py](/home/sanmu/Vision-Infused-Audio-Inpainter-VIAI/Models/VIAI_A_inpainting.py:131)  
+    forward：
+    ```python
+    mel_features = self.Mel_Encoder(self.mel_input)
+    self.mel_pred = self.Mel_Decoder(...)
+    ```
+
+15. [Models/VIAI_A_inpainting.py](/home/sanmu/Vision-Infused-Audio-Inpainter-VIAI/Models/VIAI_A_inpainting.py:136)  
+    loss：
+    ```python
+    loss_full_l1 = L1(pred, target)
+    loss_missing_l1 = abs(pred - target) * missing_mask
+    ```
+
+**Test 调用链**
+1. 命令入口  
+   `python main.py test-viai-a ...`
+
+2. [main.py](/home/sanmu/Vision-Infused-Audio-Inpainter-VIAI/main.py:225)  
+   `MODULE_MAP["test-viai-a"] -> test_viai_a`
+
+3. [test_viai_a.py](/home/sanmu/Vision-Infused-Audio-Inpainter-VIAI/test_viai_a.py:251)  
+   `main()` 创建 test dataloader，加载 checkpoint。
+
+4. [viai_a_loader.py](/home/sanmu/Vision-Infused-Audio-Inpainter-VIAI/Data_loaders/viai_a_loader.py:113)  
+   `get_data_loaders(..., phases=("test",))`
+
+5. [viai_a_loader.py](/home/sanmu/Vision-Infused-Audio-Inpainter-VIAI/Data_loaders/viai_a_loader.py:81)  
+   test 阶段 `train=False`，所以 Mel window 是中间裁剪：
+   ```python
+   return max_start // 2
+   ```
+
+6. [test_viai_a.py](/home/sanmu/Vision-Infused-Audio-Inpainter-VIAI/test_viai_a.py:186)  
+   `evaluate(model, data_loader, image_dir=...)`
+
+7. [test_viai_a.py](/home/sanmu/Vision-Infused-Audio-Inpainter-VIAI/test_viai_a.py:205)  
+   每个 test batch 也会随机缺失长度：
+   ```python
+   model.get_blank_space_length(0)
+   ```
+
+8. [test_viai_a.py](/home/sanmu/Vision-Infused-Audio-Inpainter-VIAI/test_viai_a.py:206)  
+   测试也调用：
+   ```python
+   model.set_inputs(data)
+   ```
+
+9. 所以 test 同样进入 [Models/VIAI_A_inpainting.py](/home/sanmu/Vision-Infused-Audio-Inpainter-VIAI/Models/VIAI_A_inpainting.py:120)，执行同一个：
+   ```python
+   mel_loader.corrupt_mel_spectrogram(...)
+   ```
+
+10. [test_viai_a.py](/home/sanmu/Vision-Infused-Audio-Inpainter-VIAI/test_viai_a.py:207)  
+    测试 forward：
+    ```python
+    model.test()
+    ```
+
+11. [Models/VIAI_A_inpainting.py](/home/sanmu/Vision-Infused-Audio-Inpainter-VIAI/Models/VIAI_A_inpainting.py:158)  
+    `test()` 里 no grad forward + loss：
+    ```python
+    self._forward_inpainter()
+    self._compute_losses(global_step=0)
+    ```
+
+12. [test_viai_a.py](/home/sanmu/Vision-Infused-Audio-Inpainter-VIAI/test_viai_a.py:171)  
+    `batch_metrics()` 计算：
+    ```python
+    compute_viai_a_metrics(model.mel_pred, model.mel_target_4d, model.missing_mask)
+    ```
+
+13. [utils/viai_a_metrics.py](/home/sanmu/Vision-Infused-Audio-Inpainter-VIAI/utils/viai_a_metrics.py:36)  
+    计算：
+    - full PSNR
+    - missing-region PSNR
+    - SSIM
+
+14. [test_viai_a.py](/home/sanmu/Vision-Infused-Audio-Inpainter-VIAI/test_viai_a.py:220)  
+    保存测试图片：
+    ```python
+    save_mel_comparison_batch(
+        image_dir,
+        ...,
+        model.mel_input_4d,
+        model.mel_pred,
+        model.mel_target_4d,
+    )
+    ```
+
+**重要细节**
+当前 mask 有两个随机量：
+
+- `blank_length`：每个 batch 随机一次，范围来自 `min_blank_frames ~ max_blank_frames`，默认 20 到 50 帧，也就是 0.4s 到 1.0s。
+- `start`：`corrupt_mel_spectrogram()` 内部随机一次。
+
+也就是说：**当前实现是每个 batch 共享同一个 mask start/end 和 blank_length**，不是 batch 内每个样本各自独立 mask。
+
+如果你希望 test 指标更稳定，后面可以把 test 的 mask 固定成 deterministic，例如固定 `start` 或加 `--test_mask_seed`。当前 test 每次跑同一个 checkpoint，指标会轻微变化，就是因为 mask 随机。
 
 VIAI-A 第一阶段已经补齐并通过本地 smoke test。该阶段只训练音频谱图修复模型，严格不使用视频帧、光流、visual encoder、sync loss、GAN loss 或 WaveNet。当前链路为：
 
@@ -158,7 +342,7 @@ checkpoints/viai_a_test_results/mel-image/step000001000/*.png
 ```
 
 对 `1000/2000/.../6800` 等多个 checkpoint 逐个运行 `test-viai-a` 后，直接查看 `VIAI-A_test_summary.csv` 即可横向比较。
-`mel-image/stepXXXXXXXXX/` 下会为每个测试样本保存一张四联图：masked input、prediction、target、abs error。
+`mel-image/stepXXXXXXXXX/` 下会为每个测试样本保存一张 RGB 热力图四联图：masked input、prediction、target、abs error。
 
 `test-viai-a` 会报告 normalized Mel `[0, 1]` 上的：
 

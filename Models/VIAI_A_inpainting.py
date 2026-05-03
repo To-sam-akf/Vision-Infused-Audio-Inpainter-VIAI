@@ -60,12 +60,14 @@ class VIAIAModel(object):
         self.loss_full_l1 = self.criterion_l1(self.mel_pred, self.mel_target_4d)
         masked_abs = torch.abs(self.mel_pred - self.mel_target_4d) * self.missing_mask
         self.loss_missing_l1 = masked_abs.sum() / torch.clamp(self.missing_mask.sum(), min=1.0)
+        # η1(t) = max(floor, base^(global_step / interval))
         eta1 = self._eta(
             global_step,
             getattr(self.hparams, "recon_decay_base", 0.9),
             getattr(self.hparams, "recon_decay_interval", 1000.0),
             getattr(self.hparams, "recon_decay_floor", 0.1),
         )
+        # 缺失区域单独算 L1，完整谱图也算 L1，然后用一个随训练步数衰减的 eta1 给完整谱图 L1 加权。
         self.loss_total = eta1 * self.loss_full_l1 + self.loss_missing_l1
 
     def optimize_parameters(self, global_step):
@@ -86,6 +88,9 @@ class VIAIAModel(object):
             self._compute_losses(global_step=0)
 
     def get_loss_items(self):
+        # loss_total_item       总损失
+        # loss_full_l1_item     全谱图/已知区域相关的 L1 loss
+        # loss_missing_l1_item  缺失区域的 L1 loss
         self.loss_total_item = float(self.loss_total.detach().cpu().item())
         self.loss_full_l1_item = float(self.loss_full_l1.detach().cpu().item())
         self.loss_missing_l1_item = float(self.loss_missing_l1.detach().cpu().item())

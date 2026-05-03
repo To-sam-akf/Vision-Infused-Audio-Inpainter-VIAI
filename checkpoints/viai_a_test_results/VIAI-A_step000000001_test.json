@@ -5,10 +5,10 @@
   "global_epoch": 0,
   "test_split_name": "train_viai_a_split.txt",
   "num_samples": 1,
-  "loss_total": 0.3282485604286194,
-  "mel_l1_full": 0.16345664858818054,
-  "mel_l1_missing": 0.16479191184043884,
-  "psnr_full": 13.549606323242188,
-  "psnr_missing": 13.643174171447754,
-  "ssim": 0.1415174575904991
+  "loss_total": 0.3577202558517456,
+  "mel_l1_full": 0.16349591314792633,
+  "mel_l1_missing": 0.19422432780265808,
+  "psnr_full": 13.546332359313965,
+  "psnr_missing": 12.158605575561523,
+  "ssim": 0.14162675019317064
 }

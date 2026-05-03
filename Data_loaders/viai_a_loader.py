@@ -77,7 +77,8 @@ class VIAIASplitDataset(data_utils.Dataset):
 
     def __len__(self):
         return len(self.rows)
-
+    # mel.shape = [mel_bins, mel_frames]
+    # mel[:, start : start + mel_window]
     def _choose_mel_start(self, mel_frames):
         if mel_frames <= self.mel_window:
             return 0
