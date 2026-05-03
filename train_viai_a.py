@@ -27,7 +27,7 @@ def _arg_was_passed(name):
 
 def configure_viai_a_defaults():
     if not _arg_was_passed("--name"):
-        hparams.name = "VIAI-A"
+        hparams.name = "VIAI-A-PatchGAN" if getattr(hparams, "use_gan", False) else "VIAI-A"
     if not _arg_was_passed("--train_split_name"):
         hparams.train_split_name = "train_viai_a_split.txt"
     if not _arg_was_passed("--val_split_name"):
@@ -35,7 +35,8 @@ def configure_viai_a_defaults():
     if not _arg_was_passed("--test_split_name"):
         hparams.test_split_name = "test_viai_a_split.txt"
     if not _arg_was_passed("--log_event_path"):
-        hparams.log_event_path = os.path.join(hparams.checkpoint_dir, "events_viai_a")
+        event_name = "events_viai_a_patchgan" if getattr(hparams, "use_gan", False) else "events_viai_a"
+        hparams.log_event_path = os.path.join(hparams.checkpoint_dir, event_name)
 
 
 def _positive_interval(name):
@@ -77,6 +78,14 @@ def run_phase(model, data_loader, phase, global_step, writer, global_epoch):
         "psnr_missing": 0.0,
         "ssim_full": 0.0,
     }
+    if model.use_gan:
+        totals.update(
+            {
+                "loss_recon": 0.0,
+                "loss_g_gan": 0.0,
+                "loss_d": 0.0,
+            }
+        )
     sample_count = 0
     ssim_sample_count = 0
     batch_count = 0
@@ -108,6 +117,10 @@ def run_phase(model, data_loader, phase, global_step, writer, global_epoch):
         totals["loss_total"] += model.loss_total_item
         totals["loss_full_l1"] += model.loss_full_l1_item
         totals["loss_missing_l1"] += model.loss_missing_l1_item
+        if model.use_gan:
+            totals["loss_recon"] += model.loss_recon_item
+            totals["loss_g_gan"] += model.loss_G_GAN_item
+            totals["loss_d"] += model.loss_D_item
         totals["psnr_full"] += metrics["psnr_full_sum"]
         totals["psnr_missing"] += metrics["psnr_missing_sum"]
         sample_count += metrics["num_samples"]
@@ -126,6 +139,10 @@ def run_phase(model, data_loader, phase, global_step, writer, global_epoch):
         )
         if metrics["ssim_full"] is not None:
             postfix["ssim"] = f"{metrics['ssim_full']:.4f}"
+        if model.use_gan:
+            postfix["recon"] = f"{model.loss_recon_item:.4f}"
+            postfix["g_gan"] = f"{model.loss_G_GAN_item:.4f}"
+            postfix["d"] = f"{model.loss_D_item:.4f}"
         progress.set_postfix(**postfix)
 
         if train and global_step % hparams.print_freq == 0:
@@ -135,11 +152,20 @@ def run_phase(model, data_loader, phase, global_step, writer, global_epoch):
                 if metrics["ssim_full"] is not None
                 else ""
             )
+            gan_text = (
+                f" recon={model.loss_recon_item:.6f} "
+                f"g_gan={model.loss_G_GAN_item:.6f} "
+                f"d={model.loss_D_item:.6f}"
+                if model.use_gan
+                else ""
+            )
             tqdm.write(
                 f"[VIAI-A train] step={global_step} "
                 f"loss={model.loss_total_item:.6f} "
                 f"full_l1={model.loss_full_l1_item:.6f} "
                 f"missing_l1={model.loss_missing_l1_item:.6f} "
+                f"eta1={model.eta1_item:.6f}"
+                f"{gan_text} "
                 f"psnr={metrics['psnr_full']:.3f} "
                 f"psnr_missing={metrics['psnr_missing']:.3f}"
                 f"{ssim_text} "
@@ -179,9 +205,24 @@ def run_phase(model, data_loader, phase, global_step, writer, global_epoch):
         if ssim_sample_count == 0
         else totals["ssim_full"] / ssim_sample_count,
     }
+    if model.use_gan:
+        averages.update(
+            {
+                "loss_recon": totals["loss_recon"] / batch_count,
+                "loss_g_gan": totals["loss_g_gan"] / batch_count,
+                "loss_d": totals["loss_d"] / batch_count,
+            }
+        )
     ssim_summary = (
         f" ssim={averages['ssim_full']:.6f}"
         if averages["ssim_full"] is not None
+        else ""
+    )
+    gan_summary = (
+        f" recon={averages['loss_recon']:.6f} "
+        f"g_gan={averages['loss_g_gan']:.6f} "
+        f"d={averages['loss_d']:.6f}"
+        if model.use_gan
         else ""
     )
     tqdm.write(
@@ -189,6 +230,7 @@ def run_phase(model, data_loader, phase, global_step, writer, global_epoch):
         f"loss={averages['loss_total']:.6f} "
         f"full_l1={averages['loss_full_l1']:.6f} "
         f"missing_l1={averages['loss_missing_l1']:.6f} "
+        f"{gan_summary} "
         f"psnr={averages['psnr_full']:.3f} "
         f"psnr_missing={averages['psnr_missing']:.3f}"
         f"{ssim_summary}"
@@ -196,9 +238,9 @@ def run_phase(model, data_loader, phase, global_step, writer, global_epoch):
     return global_step, stop_training, averages
 
 
-def train_loop(model, data_loaders, writer):
-    global_step = 0
-    global_epoch = 0
+def train_loop(model, data_loaders, writer, start_step=0, start_epoch=0):
+    global_step = start_step
+    global_epoch = start_epoch
     while global_epoch < hparams.nepochs:
         if "train" in data_loaders:
             global_step, stop_training, _ = run_phase(
@@ -226,8 +268,14 @@ def main():
     data_loaders = viai_a_loader.get_data_loaders(hparams.data_root, phases=("train", "val"))
     model = VIAIAModel(hparams, device=device)
 
+    global_step = 0
+    global_epoch = 0
     if hparams.resume and hparams.resume_path is not None:
-        model.load_checkpoint(hparams.resume_path, reset_optimizer=hparams.reset_optimizer)
+        global_step, global_epoch = model.load_checkpoint(
+            hparams.resume_path,
+            reset_optimizer=hparams.reset_optimizer,
+        )
+        print(f"[VIAI-A] resumed checkpoint step={global_step} epoch={global_epoch}")
 
     log_event_path = hparams.log_event_path
     if log_event_path is None:
@@ -236,7 +284,7 @@ def main():
     writer = SummaryWriter(log_dir=log_event_path)
 
     try:
-        train_loop(model, data_loaders, writer)
+        train_loop(model, data_loaders, writer, start_step=global_step, start_epoch=global_epoch)
     except KeyboardInterrupt:
         print("Interrupted!")
     finally:

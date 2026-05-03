@@ -750,3 +750,196 @@ PNG mode 检查已通过：
 ```text
 RGB (812, 98) checkpoints/viai_a_test_results/mel-image/step000000001/000000_processed_accordion_A2p8VW61RGc.png
 ```
+
+## 2026-05-03 VIAI-A 第二阶段 PatchGAN
+
+### 背景与目标
+根据 `information.md` 中“8.2 第二阶段：加入 PatchGAN”的要求，本次在 VIAI-A audio-only 基础上加入可选 PatchGAN 训练。默认 `train-viai-a` 仍保持 8.1 的 L1-only baseline；显式传入 `--use_gan` 后启用判别器和 GAN loss，用于提升生成 Mel-spectrogram 的局部纹理真实感。
+
+### 本次修改内容
+1. `base_options.py`
+   - 新增 `--use_gan`，默认关闭。
+   - 继续复用 `--beta_gan`、`--lambda_recon` 和 `--recon_decay_*`。
+2. `Models/VIAI_A_inpainting.py`
+   - `--use_gan` 开启时实例化 `Discriminator_Networks.MelDiscriminator()`、`GANLoss(use_lsgan=False)` 和 `optimizer_D`。
+   - 将 reconstruction loss 拆为 `loss_recon = eta1 * loss_full_l1 + loss_missing_l1`。
+   - PatchGAN 训练目标初版误写为 `loss_total = lambda_recon * loss_recon + beta_gan * loss_G_GAN`，后续已按论文第 4 页式 (3) 修正为 `loss_total = loss_G_GAN + beta_gan * loss_recon`。
+   - 判别器目标为 `loss_D = 0.5 * (loss_D_real + loss_D_fake)`，fake 分支使用 `mel_pred.detach()`。
+   - checkpoint 新增可选 `netD`、`optimizer_D`、`use_gan` 字段。
+   - 从 8.1 checkpoint 热启动时允许缺少 `netD/optimizer_D`，判别器随机初始化。
+3. `train_viai_a.py`
+   - `--use_gan` 且未传 `--name` 时默认使用 `VIAI-A-PatchGAN`。
+   - `--use_gan` 且未传 `--log_event_path` 时默认写到 `checkpoints/events_viai_a_patchgan`。
+   - 修复 resume 后 `global_step/global_epoch` 被重置的问题。
+   - 训练日志和 TensorBoard 增加 `loss_recon`、`loss_g_gan`、`loss_d`、`loss_d_real`、`loss_d_fake`、`eta1`。
+4. `test_viai_a.py`
+   - `--use_gan` 时测试也默认使用 `VIAI-A-PatchGAN`。
+   - JSON/CSV 新增 `use_gan`、`loss_recon`、`loss_g_gan`、`loss_d`、`eta1`、`beta_gan`、`lambda_recon`。
+5. `README.md`
+   - 新增“第二阶段：加入 PatchGAN”操作流程。
+   - 保留 8.1 baseline 命令，并补充 stage2 smoke train、正式 train、test 命令。
+
+### README 中记录的第二阶段命令
+1. 8.1 baseline 训练不变：
+```bash
+python main.py train-viai-a -- --batch_size 16 --num_workers 4 --display_id 0
+```
+
+2. 从 8.1 checkpoint 热启动 stage2 smoke test：
+```bash
+python main.py train-viai-a -- \
+  --use_gan \
+  --name VIAI-A-PatchGAN \
+  --resume \
+  --resume_path checkpoints/VIAI-A_checkpoint_step000000001.pth.tar \
+  --reset_optimizer \
+  --batch_size 1 \
+  --num_workers 0 \
+  --max_train_steps 2 \
+  --display_id 0
+```
+
+3. Stage2 正式训练：
+```bash
+python main.py train-viai-a -- \
+  --use_gan \
+  --name VIAI-A-PatchGAN \
+  --resume \
+  --resume_path checkpoints/VIAI-A_checkpoint_step000001000.pth.tar \
+  --reset_optimizer \
+  --batch_size 16 \
+  --num_workers 4 \
+  --beta_gan 0.1 \
+  --checkpoint_interval 1000 \
+  --print_freq 100 \
+  --display_id 0
+```
+
+4. Stage2 测试：
+```bash
+python main.py test-viai-a -- \
+  --use_gan \
+  --name VIAI-A-PatchGAN \
+  --resume_path checkpoints/VIAI-A-PatchGAN_checkpoint_step000002000.pth.tar \
+  --batch_size 16 \
+  --num_workers 4 \
+  --display_id 0 \
+  --results_dir checkpoints/viai_a_patchgan_test_results
+```
+
+### 本次实际验证结果
+静态检查已通过：
+```bash
+.venv/bin/python -m py_compile base_options.py Models/VIAI_A_inpainting.py train_viai_a.py test_viai_a.py
+```
+
+8.1 baseline 回归 smoke test 已通过。为避免覆盖仓库内 checkpoint，本次验证写入 `/tmp/viai_patchgan_smoke_baseline`：
+```bash
+.venv/bin/python main.py train-viai-a -- --data_root data --checkpoint_dir /tmp/viai_patchgan_smoke_baseline --log_event_path /tmp/viai_patchgan_smoke_baseline/events --batch_size 1 --num_workers 0 --max_train_steps 1 --display_id 0 --print_freq 1
+```
+
+关键输出：
+```text
+[VIAI-A train] step=1 loss=0.590856 full_l1=0.293740 missing_l1=0.297116 eta1=1.000000 psnr=9.163 psnr_missing=9.029 ssim=0.033071
+Saved VIAI-A checkpoint: /tmp/viai_patchgan_smoke_baseline/VIAI-A_checkpoint_step000000001.pth.tar
+```
+
+PatchGAN 从旧 8.1 checkpoint 热启动 smoke test 已通过，验证了旧 checkpoint 缺少 `netD/optimizer_D` 时不会报错：
+```bash
+.venv/bin/python main.py train-viai-a -- --use_gan --data_root data --checkpoint_dir /tmp/viai_patchgan_smoke_gan --log_event_path /tmp/viai_patchgan_smoke_gan/events --resume --resume_path checkpoints/VIAI-A_checkpoint_step000000001.pth.tar --reset_optimizer --batch_size 1 --num_workers 0 --max_train_steps 2 --display_id 0 --print_freq 1
+```
+
+关键输出：
+```text
+[VIAI-A] resumed checkpoint step=1 epoch=0
+[VIAI-A train] step=2 loss=0.786060 full_l1=0.358661 missing_l1=0.349788 eta1=0.999895 recon=0.708411 g_gan=0.776496 d=0.714494 psnr=7.454 psnr_missing=7.864
+Saved VIAI-A checkpoint: /tmp/viai_patchgan_smoke_gan/VIAI-A-PatchGAN_checkpoint_step000000002.pth.tar
+```
+
+PatchGAN 测试入口已通过：
+```bash
+.venv/bin/python main.py test-viai-a -- --use_gan --data_root data --resume_path /tmp/viai_patchgan_smoke_gan/VIAI-A-PatchGAN_checkpoint_step000000002.pth.tar --test_split_name train_viai_a_split.txt --batch_size 1 --num_workers 0 --display_id 0 --results_dir /tmp/viai_patchgan_smoke_results
+```
+
+关键输出：
+```text
+[VIAI-A test] samples=1 loss=0.400465 recon=0.332187 g_gan=0.682783 d=0.692535 eta1=1.000000 mel_l1_full=0.168928 mel_l1_missing=0.163259 psnr_full=13.279 psnr_missing=13.602 ssim=0.1412
+[VIAI-A test] wrote json: /tmp/viai_patchgan_smoke_results/VIAI-A-PatchGAN_step000000002_test.json
+[VIAI-A test] wrote summary csv: /tmp/viai_patchgan_smoke_results/VIAI-A-PatchGAN_test_summary.csv
+```
+
+测试 JSON 字段检查已通过，包含：
+```text
+use_gan=true, loss_recon, loss_g_gan, loss_d, eta1, beta_gan, lambda_recon
+```
+
+TensorBoard event tag 检查已通过，PatchGAN 标量包含：
+```text
+train/loss_recon, train/loss_g_gan, train/loss_d, train/loss_d_real, train/loss_d_fake, train/eta1
+```
+
+PatchGAN checkpoint 字段检查已通过：
+```text
+netD, optimizer_D, use_gan, global_step, global_epoch
+```
+
+## 2026-05-03 VIAI-A PatchGAN loss 权重方向修正
+
+### 背景
+论文第 4 页式 (3) 写作：
+```text
+L_total^a = L_Gen^a = L_GAN^a + beta * L_re^a
+```
+
+因此 VIAI-A PatchGAN 中 β 应当乘在 reconstruction loss 上，而不是乘在 GAN loss 上。当前代码保留 `--beta_gan` 这个历史参数名，但在 VIAI-A PatchGAN 中它对应论文公式里的 β。
+
+### 修改内容
+1. `Models/VIAI_A_inpainting.py`
+   - 将 `--use_gan` 分支的生成器总损失从：
+```python
+self.loss_total = lambda_recon * self.loss_recon + beta_gan * self.loss_G_GAN
+```
+   - 修正为：
+```python
+self.loss_total = self.loss_G_GAN + beta_gan * self.loss_recon
+```
+   - L1-only baseline 分支仍保持 `self.loss_total = self.loss_recon`。
+2. `README.md`
+   - 第二阶段公式改为 `loss_total = loss_g_gan + beta_gan * loss_recon`。
+   - 移除 VIAI-A PatchGAN 训练命令中的 `--lambda_recon 1.0`。
+   - 增加 `--beta_gan` 在 VIAI-A PatchGAN 中对应论文 β 的说明。
+
+### 验证命令
+```bash
+.venv/bin/python -m py_compile Models/VIAI_A_inpainting.py train_viai_a.py test_viai_a.py
+.venv/bin/python main.py train-viai-a -- --use_gan --data_root data --checkpoint_dir /tmp/viai_patchgan_formula_smoke --log_event_path /tmp/viai_patchgan_formula_smoke/events --resume --resume_path checkpoints/VIAI-A_checkpoint_step000000001.pth.tar --reset_optimizer --batch_size 1 --num_workers 0 --max_train_steps 2 --display_id 0 --print_freq 1
+```
+
+### 待记录 smoke test 关键输出
+已通过 PatchGAN smoke test：
+```bash
+.venv/bin/python main.py train-viai-a -- --use_gan --data_root data --checkpoint_dir /tmp/viai_patchgan_formula_smoke --log_event_path /tmp/viai_patchgan_formula_smoke/events --resume --resume_path checkpoints/VIAI-A_checkpoint_step000000001.pth.tar --reset_optimizer --batch_size 1 --num_workers 0 --max_train_steps 2 --display_id 0 --print_freq 1
+```
+
+关键输出：
+```text
+[VIAI-A] resumed checkpoint step=1 epoch=0
+[VIAI-A train] step=2 loss=0.683178 full_l1=0.264623 missing_l1=0.249545 eta1=0.999895 recon=0.514140 g_gan=0.631764 d=0.701329 psnr=9.798 psnr_missing=10.176
+Saved VIAI-A checkpoint: /tmp/viai_patchgan_formula_smoke/VIAI-A-PatchGAN_checkpoint_step000000002.pth.tar
+```
+
+公式核对：
+```text
+0.631764 + 0.1 * 0.514140 = 0.683178
+```
+
+8.1 baseline 回归 smoke test 已通过，不传 `--use_gan` 时日志不包含 `g_gan/d`，仍然只使用 reconstruction loss：
+```bash
+.venv/bin/python main.py train-viai-a -- --data_root data --checkpoint_dir /tmp/viai_patchgan_formula_baseline --log_event_path /tmp/viai_patchgan_formula_baseline/events --batch_size 1 --num_workers 0 --max_train_steps 1 --display_id 0 --print_freq 1
+```
+
+关键输出：
+```text
+[VIAI-A train] step=1 loss=0.560637 full_l1=0.289882 missing_l1=0.270755 eta1=1.000000 psnr=9.138 psnr_missing=9.589 ssim=0.009980
+Saved VIAI-A checkpoint: /tmp/viai_patchgan_formula_baseline/VIAI-A_checkpoint_step000000001.pth.tar
+```

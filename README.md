@@ -319,7 +319,84 @@ VIAI-A checkpoint 命名格式为：
 checkpoints/VIAI-A_checkpoint_step*.pth.tar
 ```
 
-#### 5. 云端测试 VIAI-A
+#### 5. 第二阶段：加入 PatchGAN
+
+第二阶段在 8.1 的 VIAI-A audio-only 生成器基础上显式加入 PatchGAN。默认 `train-viai-a` 仍然是第一阶段 L1-only baseline；只有传入 `--use_gan` 时才会启用 `MelDiscriminator + GANLoss(use_lsgan=False)`。开启后训练目标为：
+
+```text
+loss_recon = eta1(t) * full_l1 + missing_l1
+loss_total = loss_g_gan + beta_gan * loss_recon
+loss_d = 0.5 * (loss_d_real + loss_d_fake)
+```
+
+这里的 `--beta_gan` 是历史参数名；在 VIAI-A PatchGAN 中它对应论文第 4 页式 (3) 的 β，实际权重加在 reconstruction loss 上。
+
+如果从第一阶段 checkpoint 热启动，建议重置 optimizer，让新的 GAN 目标从干净的优化器状态开始：
+
+```bash
+python main.py train-viai-a -- \
+  --use_gan \
+  --name VIAI-A-PatchGAN \
+  --resume \
+  --resume_path checkpoints/VIAI-A_checkpoint_step000000001.pth.tar \
+  --reset_optimizer \
+  --batch_size 1 \
+  --num_workers 0 \
+  --max_train_steps 2 \
+  --display_id 0
+```
+
+正式训练示例：
+
+```bash
+python main.py train-viai-a -- \
+  --use_gan \
+  --name VIAI-A-PatchGAN \
+  --resume \
+  --resume_path checkpoints/VIAI-A_checkpoint_step000001000.pth.tar \
+  --reset_optimizer \
+  --batch_size 16 \
+  --num_workers 4 \
+  --beta_gan 0.1 \
+  --checkpoint_interval 1000 \
+  --print_freq 100 \
+  --display_id 0
+```
+
+如果传 `--use_gan` 但不传 `--name`，脚本默认使用 `VIAI-A-PatchGAN`，避免覆盖第一阶段 `VIAI-A` checkpoint。TensorBoard 默认写到：
+
+```text
+checkpoints/events_viai_a_patchgan
+```
+
+第二阶段 checkpoint 命名格式为：
+
+```text
+checkpoints/VIAI-A-PatchGAN_checkpoint_step*.pth.tar
+```
+
+测试第二阶段 checkpoint 时也要传 `--use_gan`，这样 `loss_total` 会包含 GAN 项；如果不传，则只按生成器的 reconstruction/PSNR/SSIM 路径评估：
+
+```bash
+python main.py test-viai-a -- \
+  --use_gan \
+  --name VIAI-A-PatchGAN \
+  --resume_path checkpoints/VIAI-A-PatchGAN_checkpoint_step000002000.pth.tar \
+  --batch_size 16 \
+  --num_workers 4 \
+  --display_id 0 \
+  --results_dir checkpoints/viai_a_patchgan_test_results
+```
+
+PatchGAN 测试 JSON/CSV 会额外记录：
+
+```text
+use_gan, loss_recon, loss_g_gan, loss_d, eta1, beta_gan, lambda_recon
+```
+
+其中 `lambda_recon` 仅作为历史配置字段保留在结果表中，VIAI-A PatchGAN 的 loss 计算不读取它。
+
+#### 6. 云端测试 VIAI-A
 
 测试指定 checkpoint：
 

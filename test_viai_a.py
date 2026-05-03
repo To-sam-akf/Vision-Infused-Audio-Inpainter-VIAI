@@ -27,8 +27,15 @@ RESULT_FIELDS = [
     "global_step",
     "global_epoch",
     "test_split_name",
+    "use_gan",
     "num_samples",
     "loss_total",
+    "loss_recon",
+    "loss_g_gan",
+    "loss_d",
+    "eta1",
+    "beta_gan",
+    "lambda_recon",
     "mel_l1_full",
     "mel_l1_missing",
     "psnr_full",
@@ -43,7 +50,7 @@ def _arg_was_passed(name):
 
 def configure_viai_a_defaults():
     if not _arg_was_passed("--name"):
-        hparams.name = "VIAI-A"
+        hparams.name = "VIAI-A-PatchGAN" if getattr(hparams, "use_gan", False) else "VIAI-A"
     if not _arg_was_passed("--train_split_name"):
         hparams.train_split_name = "train_viai_a_split.txt"
     if not _arg_was_passed("--val_split_name"):
@@ -94,8 +101,15 @@ def build_result_record(checkpoint_path, checkpoint_step_value, global_step, glo
         "global_step": int(global_step),
         "global_epoch": int(global_epoch),
         "test_split_name": hparams.test_split_name,
+        "use_gan": bool(getattr(hparams, "use_gan", False)),
         "num_samples": int(results["num_samples"]),
         "loss_total": float(results["loss_total"]),
+        "loss_recon": float(results["loss_recon"]),
+        "loss_g_gan": float(results["loss_g_gan"]),
+        "loss_d": float(results["loss_d"]),
+        "eta1": float(results["eta1"]),
+        "beta_gan": float(getattr(hparams, "beta_gan", 0.1)),
+        "lambda_recon": float(getattr(hparams, "lambda_recon", 1.0)),
         "mel_l1_full": float(results["mel_l1_full"]),
         "mel_l1_missing": float(results["mel_l1_missing"]),
         "psnr_full": float(results["psnr_full"]),
@@ -109,6 +123,12 @@ def coerce_csv_record(row):
     int_fields = {"checkpoint_step", "global_step", "global_epoch", "num_samples"}
     float_fields = {
         "loss_total",
+        "loss_recon",
+        "loss_g_gan",
+        "loss_d",
+        "eta1",
+        "beta_gan",
+        "lambda_recon",
         "mel_l1_full",
         "mel_l1_missing",
         "psnr_full",
@@ -186,6 +206,10 @@ def batch_metrics(model):
 def evaluate(model, data_loader, image_dir=None):
     totals = {
         "loss_total": 0.0,
+        "loss_recon": 0.0,
+        "loss_g_gan": 0.0,
+        "loss_d": 0.0,
+        "eta1": 0.0,
         "full_l1": 0.0,
         "missing_l1": 0.0,
         "full_psnr": 0.0,
@@ -210,6 +234,10 @@ def evaluate(model, data_loader, image_dir=None):
         batch_size = metrics["num_samples"]
 
         totals["loss_total"] += model.loss_total_item
+        totals["loss_recon"] += model.loss_recon_item
+        totals["loss_g_gan"] += model.loss_G_GAN_item
+        totals["loss_d"] += model.loss_D_item
+        totals["eta1"] += model.eta1_item
         totals["full_l1"] += model.loss_full_l1_item
         totals["missing_l1"] += model.loss_missing_l1_item
         totals["full_psnr"] += metrics["full_psnr"]
@@ -226,19 +254,27 @@ def evaluate(model, data_loader, image_dir=None):
                 model.mel_pred,
                 model.mel_target_4d,
             )
-        progress.set_postfix(
-            loss=f"{model.loss_total_item:.4f}",
-            full_l1=f"{model.loss_full_l1_item:.4f}",
-            missing_l1=f"{model.loss_missing_l1_item:.4f}",
-            psnr=f"{metrics['full_psnr'] / batch_size:.2f}",
-            ssim=f"{metrics['ssim'] / batch_size:.4f}",
-        )
+        postfix = {
+            "loss": f"{model.loss_total_item:.4f}",
+            "full_l1": f"{model.loss_full_l1_item:.4f}",
+            "missing_l1": f"{model.loss_missing_l1_item:.4f}",
+            "psnr": f"{metrics['full_psnr'] / batch_size:.2f}",
+            "ssim": f"{metrics['ssim'] / batch_size:.4f}",
+        }
+        if model.use_gan:
+            postfix["g_gan"] = f"{model.loss_G_GAN_item:.4f}"
+            postfix["d"] = f"{model.loss_D_item:.4f}"
+        progress.set_postfix(**postfix)
 
     if batch_count == 0:
         raise RuntimeError("VIAI-A test dataloader is empty.")
 
     return {
         "loss_total": totals["loss_total"] / batch_count,
+        "loss_recon": totals["loss_recon"] / batch_count,
+        "loss_g_gan": totals["loss_g_gan"] / batch_count,
+        "loss_d": totals["loss_d"] / batch_count,
+        "eta1": totals["eta1"] / batch_count,
         "mel_l1_full": totals["full_l1"] / batch_count,
         "mel_l1_missing": totals["missing_l1"] / batch_count,
         "psnr_full": totals["full_psnr"] / sample_count,
@@ -282,6 +318,10 @@ def main():
         "[VIAI-A test] "
         f"samples={results['num_samples']} "
         f"loss={results['loss_total']:.6f} "
+        f"recon={results['loss_recon']:.6f} "
+        f"g_gan={results['loss_g_gan']:.6f} "
+        f"d={results['loss_d']:.6f} "
+        f"eta1={results['eta1']:.6f} "
         f"mel_l1_full={results['mel_l1_full']:.6f} "
         f"mel_l1_missing={results['mel_l1_missing']:.6f} "
         f"psnr_full={results['psnr_full']:.3f} "

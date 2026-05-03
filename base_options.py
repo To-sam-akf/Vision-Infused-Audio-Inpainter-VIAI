@@ -90,6 +90,11 @@ class BaseOptions(object):
         )
 
         # Loss weights (paper-style objective)
+        self.parser.add_argument(
+            "--use_gan",
+            action="store_true",
+            help="For VIAI-A stage 2, enable PatchGAN discriminator and GAN loss.",
+        )
         self.parser.add_argument("--lambda_recon", type=float, default=1.0)
         self.parser.add_argument("--beta_gan", type=float, default=0.1)
         self.parser.add_argument("--lambda_sync", type=float, default=1.0)
