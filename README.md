@@ -12,16 +12,6 @@ We present a vision-infused method that can deal with both audio-only and audio-
 * [opencv-contrib-python](https://pypi.org/project/opencv-contrib-python/) for TV-L1 optical flow
 
 ### 第一阶段：VIAI-A Audio-Only
-是的：**train 和 test 过程都会对 Mel 使用 mask**。  
-准确地说，mask 不在 `viai_a_loader.py` 里做，而是在模型封装的 `VIAIAModel.set_inputs()` 里做，所以 train / val / test 只要调用 `model.set_inputs(data)`，都会执行同一套 Mel corruption/mask 逻辑。
-
-**核心结论**
-- `viai_a_loader.py`：只负责加载 `mel.npy`，裁出 80x200 Mel window。
-- `VIAIAModel.set_inputs()`：对 Mel 做随机缺失段 mask，并用边界插值填充 corrupted input。
-- `train_viai_a.py`：训练和验证都会调用 `set_inputs()`，所以都会 mask。
-- `test_viai_a.py`：测试也会调用 `set_inputs()`，所以 test 也会 mask。
-- 当前 mask 是“插值 mask”，不是黑色/零值 mask，所以 masked input 看起来会和 target 很像。
-
 **Train 调用链**
 1. 命令入口  
    `python main.py train-viai-a ...`
@@ -187,16 +177,6 @@ We present a vision-infused method that can deal with both audio-only and audio-
     )
     ```
 
-**重要细节**
-当前 mask 有两个随机量：
-
-- `blank_length`：每个 batch 随机一次，范围来自 `min_blank_frames ~ max_blank_frames`，默认 20 到 50 帧，也就是 0.4s 到 1.0s。
-- `start`：`corrupt_mel_spectrogram()` 内部随机一次。
-
-也就是说：**当前实现是每个 batch 共享同一个 mask start/end 和 blank_length**，不是 batch 内每个样本各自独立 mask。
-
-如果你希望 test 指标更稳定，后面可以把 test 的 mask 固定成 deterministic，例如固定 `start` 或加 `--test_mask_seed`。当前 test 每次跑同一个 checkpoint，指标会轻微变化，就是因为 mask 随机。
-
 VIAI-A 第一阶段已经补齐并通过本地 smoke test。该阶段只训练音频谱图修复模型，严格不使用视频帧、光流、visual encoder、sync loss、GAN loss 或 WaveNet。当前链路为：
 
 ```text
@@ -216,24 +196,74 @@ prepare-viai-a -> split-data --audio-only -> train-viai-a 1 step -> test-viai-a
 ```bash
 cd /root/Vision-Infused-Audio-Inpainter-VIAI
 python -m pip install --upgrade pip
-python -m pip install imageio-ffmpeg librosa nnmnkwii numpy opencv-contrib-python pillow scikit-image tensorboard tensorboardX tqdm "yt-dlp[default]"
-python -c "import torch, librosa, cv2, nnmnkwii, tensorboardX, tqdm; from skimage.metrics import structural_similarity; print(torch.__version__, torch.cuda.is_available())"
+python -m pip install imageio-ffmpeg librosa nnmnkwii "numpy==1.22.4" opencv-contrib-python-headless pillow scikit-image tensorboard tensorboardX tqdm "yt-dlp[default]"
+python -c "import torch, librosa, cv2, nnmnkwii, tensorboardX, tqdm; from skimage.metrics import structural_similarity; print(torch.__version__, torch.cuda.is_available(), cv2.__version__)"
 ```
 
-如果云端已经通过 `conda` 或平台镜像安装了部分依赖，可以只安装缺失项。确认 `torch.cuda.is_available()` 输出为 `True` 后再开始训练。
+如果云端已经通过 `conda` 或平台镜像安装了部分依赖，可以只安装缺失项。Python 3.8、`scipy==1.6.3`、`numba==0.56.4` 这类旧环境不要升级到 `numpy>=1.24`，否则会出现依赖冲突。确认 `torch.cuda.is_available()` 输出为 `True` 后再开始训练。
+
+如果 `cv2.VideoCapture(...).isOpened()` 对已有 mp4 返回 `False`，并且 `cv2.getBuildInformation()` 里显示 `FFMPEG: NO`，说明当前 Python 加载的 OpenCV 不支持 mp4 解码。先清理旧 OpenCV 包和残留目录，再安装 headless contrib 版本：
+
+```bash
+python -m pip uninstall -y opencv-python opencv-python-headless opencv-contrib-python opencv-contrib-python-headless
+
+CV2_DIR=$(python - <<'PY'
+import glob
+paths = glob.glob("/usr/local/lib/python*/dist-packages/cv2") + glob.glob("/usr/local/lib/python*/site-packages/cv2")
+print(paths[0] if paths else "")
+PY
+)
+if [ -n "$CV2_DIR" ]; then
+  rm -rf "$CV2_DIR"
+fi
+
+python -m pip install --no-cache-dir "numpy==1.22.4" "opencv-contrib-python-headless==4.10.0.84"
+```
+
+重新验证 OpenCV 视频解码和 TV-L1：
+
+```bash
+python - <<'PY'
+import cv2
+
+print("cv2:", cv2.__version__, cv2.__file__)
+print("has tvl1:", hasattr(cv2, "optflow") or hasattr(cv2, "DualTVL1OpticalFlow_create"))
+for line in cv2.getBuildInformation().splitlines():
+    if "FFMPEG" in line or "GStreamer" in line:
+        print(line)
+
+p = "/root/shared-nvme/data/raw_videos/accordion/-DlGdZNAsxA.mp4"
+cap = cv2.VideoCapture(p)
+print("opened:", cap.isOpened())
+print("frames:", cap.get(cv2.CAP_PROP_FRAME_COUNT))
+print("fps:", cap.get(cv2.CAP_PROP_FPS))
+cap.release()
+PY
+```
+
+后续命令统一使用云端数据根目录：
+
+```bash
+export DATA_ROOT=/root/shared-nvme/data
+```
 
 #### 1. 下载 MUSICES 视频
 
 如果云端可以访问 YouTube，直接下载：
 
 ```bash
-python main.py prepare-data -- download --skip-existing
+python main.py prepare-data -- download \
+  --json "$DATA_ROOT/MUSICES.json" \
+  --data-root "$DATA_ROOT" \
+  --skip-existing
 ```
 
 如果 YouTube 需要 cookies，把 Netscape 格式 cookies 文件上传到云端后运行：
 
 ```bash
 python main.py prepare-data -- download \
+  --json "$DATA_ROOT/MUSICES.json" \
+  --data-root "$DATA_ROOT" \
   --skip-existing \
   --yt-dlp-extra-arg=--cookies \
   --yt-dlp-extra-arg=/absolute/path/to/youtube_cookies.txt
@@ -252,7 +282,10 @@ python main.py prepare-data -- download \
 该命令只抽取音频并生成 Mel，不提取视频帧和光流：
 
 ```bash
-python main.py prepare-viai-a -- --skip-existing
+python main.py prepare-viai-a -- \
+  --json "$DATA_ROOT/MUSICES.json" \
+  --data-root "$DATA_ROOT" \
+  --skip-existing
 ```
 
 默认参数已经对齐第一阶段论文设置：16kHz mono、80 Mel bins、STFT length 1280、hop size 320、125Hz-7.6kHz。输出文件位于：
@@ -266,8 +299,8 @@ python main.py prepare-viai-a -- --skip-existing
 #### 3. 生成 VIAI-A 训练/验证/测试划分
 
 ```bash
-python main.py split-data -- --audio-only
-wc -l /root/shared-nvme/data/train_viai_a_split.txt /root/shared-nvme/data/val_viai_a_split.txt /root/shared-nvme/data/test_viai_a_split.txt
+python main.py split-data -- --data-root "$DATA_ROOT" --audio-only
+wc -l "$DATA_ROOT/train_viai_a_split.txt" "$DATA_ROOT/val_viai_a_split.txt" "$DATA_ROOT/test_viai_a_split.txt"
 ```
 
 `--audio-only` 模式只要求样本中存在 `raw_audio.npy` 和 `mel.npy`。默认输出：
@@ -283,13 +316,13 @@ wc -l /root/shared-nvme/data/train_viai_a_split.txt /root/shared-nvme/data/val_v
 先跑 1 step sanity check：
 
 ```bash
-python main.py train-viai-a -- --batch_size 1 --num_workers 0 --max_train_steps 1 --display_id 0
+python main.py train-viai-a -- --data_root "$DATA_ROOT" --batch_size 1 --num_workers 0 --max_train_steps 1 --display_id 0
 ```
 
 确认能保存 `checkpoints/VIAI-A_checkpoint_step000000001.pth.tar` 后，开始正式训练：
 
 ```bash
-python main.py train-viai-a -- --batch_size 16 --num_workers 4 --display_id 0 --checkpoint_interval 1000 --print_freq 100
+python main.py train-viai-a -- --data_root "$DATA_ROOT" --batch_size 16 --num_workers 4 --display_id 0 --checkpoint_interval 1000 --print_freq 100
 ```
 
 训练时终端 `tqdm` 会实时显示 loss、full/missing PSNR、mask 长度，并按 `--metric_freq` 计算 SSIM。TensorBoard 默认写到 `checkpoints/events_viai_a`，包含 loss、PSNR、SSIM、mask 长度、learning rate 和 Mel 谱图对比图：
@@ -304,13 +337,13 @@ ssh -p 2233 -L 6006:localhost:6006 -l 'root@ackcs-00gjgrzt' ssh.bj8.bz1.paratera
 常用监督频率参数：
 
 ```bash
-python main.py train-viai-a -- --batch_size 16 --num_workers 4 --metric_freq 100 --tb_image_freq 500 --tb_image_count 4
+python main.py train-viai-a -- --data_root "$DATA_ROOT" --batch_size 16 --num_workers 4 --metric_freq 100 --tb_image_freq 500 --tb_image_count 4
 ```
 
 如果显存不足，优先降低 `--batch_size`，例如：
 
 ```bash
-python main.py train-viai-a -- --batch_size 8 --num_workers 4 --display_id 0 --checkpoint_interval 1000 --print_freq 100
+python main.py train-viai-a -- --data_root "$DATA_ROOT" --batch_size 8 --num_workers 4 --display_id 0 --checkpoint_interval 1000 --print_freq 100
 ```
 
 VIAI-A checkpoint 命名格式为：
@@ -319,7 +352,7 @@ VIAI-A checkpoint 命名格式为：
 checkpoints/VIAI-A_checkpoint_step*.pth.tar
 ```
 
-#### 5. 第二阶段：加入 PatchGAN
+### 5. 第二阶段：加入 PatchGAN
 
 第二阶段在 8.1 的 VIAI-A audio-only 生成器基础上显式加入 PatchGAN。默认 `train-viai-a` 仍然是第一阶段 L1-only baseline；只有传入 `--use_gan` 时才会启用 `MelDiscriminator + GANLoss(use_lsgan=False)`。开启后训练目标为：
 
@@ -337,6 +370,7 @@ loss_d = 0.5 * (loss_d_real + loss_d_fake)
 python main.py train-viai-a -- \
   --use_gan \
   --name VIAI-A-PatchGAN \
+  --data_root "$DATA_ROOT" \
   --resume \
   --resume_path checkpoints/VIAI-A_checkpoint_step000000001.pth.tar \
   --reset_optimizer \
@@ -352,6 +386,7 @@ python main.py train-viai-a -- \
 python main.py train-viai-a -- \
   --use_gan \
   --name VIAI-A-PatchGAN \
+  --data_root "$DATA_ROOT" \
   --resume \
   --resume_path checkpoints/VIAI-A_checkpoint_step000001000.pth.tar \
   --reset_optimizer \
@@ -381,6 +416,7 @@ checkpoints/VIAI-A-PatchGAN_checkpoint_step*.pth.tar
 python main.py test-viai-a -- \
   --use_gan \
   --name VIAI-A-PatchGAN \
+  --data_root "$DATA_ROOT" \
   --resume_path checkpoints/VIAI-A-PatchGAN_checkpoint_step000002000.pth.tar \
   --batch_size 16 \
   --num_workers 4 \
@@ -401,13 +437,13 @@ use_gan, loss_recon, loss_g_gan, loss_d, eta1, beta_gan, lambda_recon
 测试指定 checkpoint：
 
 ```bash
-python main.py test-viai-a -- --resume_path checkpoints/VIAI-A_checkpoint_step000001000.pth.tar --batch_size 16 --num_workers 4 --display_id 0 --results_dir checkpoints/viai_a_test_results
+python main.py test-viai-a -- --data_root "$DATA_ROOT" --resume_path checkpoints/VIAI-A_checkpoint_step000001000.pth.tar --batch_size 16 --num_workers 4 --display_id 0 --results_dir checkpoints/viai_a_test_results
 ```
 
 如果不传 `--resume_path`，测试脚本会在 `checkpoints/` 下自动寻找最新的 `VIAI-A_checkpoint_step*.pth.tar`：
 
 ```bash
-python main.py test-viai-a -- --batch_size 16 --num_workers 4 --display_id 0
+python main.py test-viai-a -- --data_root "$DATA_ROOT" --batch_size 16 --num_workers 4 --display_id 0
 ```
 
 每次测试会把当前 checkpoint 的指标写入 JSON，并更新一个按 checkpoint step 去重排序的 CSV 总表：
@@ -419,7 +455,7 @@ checkpoints/viai_a_test_results/mel-image/step000001000/*.png
 ```
 
 对 `1000/2000/.../6800` 等多个 checkpoint 逐个运行 `test-viai-a` 后，直接查看 `VIAI-A_test_summary.csv` 即可横向比较。
-`mel-image/stepXXXXXXXXX/` 下会为每个测试样本保存一张 RGB 热力图四联图：masked input、prediction、target、abs error。
+`mel-image/stepXXXXXXXXX/` 下会为每个测试样本保存一张 RGB 热力图四联图：masked、interpolated、prediction、groundtruth。
 
 `test-viai-a` 会报告 normalized Mel `[0, 1]` 上的：
 
@@ -432,6 +468,143 @@ ssim
 ```
 
 注意：第一阶段只评估 Mel-spectrogram 修复质量，不生成 waveform，也不计算 SDR / OPS / MOS。
+
+### 7. 第三阶段：加入视频分支 VIAI-AV
+
+第三阶段对应 `information.md` 8.3，只加入视频动作条件分支：
+
+```text
+视频抽帧 -> TV-L1 光流 -> Image ResNet18 + Flow ResNet18 -> Efuse 时间融合 -> MelDecoderImage 融合解码
+```
+
+本阶段不加入 `contrastive sync loss`、`VIAI-AA' probe loss`、`η2(t)` 或 WaveNet，这些留到 8.4 及后续阶段。VIAI-AV 输入仍是 4 秒窗口：`80x200` Mel、50 帧 RGB、50 帧 2-channel flow。默认从第二阶段 `VIAI-A-PatchGAN` checkpoint 初始化音频侧权重，视频分支随机初始化。
+
+先生成包含 image/flow 的 AV 样本。该流程默认使用论文风格设置：裁掉视频前 6 秒、OpenCV shot detection 近似、在有效 shot 内切非重叠 4 秒 clip、每个 clip 保存 50 帧视觉输入、TV-L1 optical flow、`flow_clip=20`、motion crop、square padding：
+
+```bash
+python main.py prepare-data -- process \
+  --json "$DATA_ROOT/MUSICES.json" \
+  --data-root "$DATA_ROOT" \
+  --skip-existing \
+  --max-clips-per-video 5
+```
+
+这个步骤会比较慢，但现在只有 shot detection 仍需要扫描长视频；TV-L1、image/flow 写入和 Mel 生成都以 4 秒 clip 为单位执行，每个 clip 默认只计算 50 帧视觉输入。`--max-clips-per-video 5` 会先从每个源视频的所有有效 4 秒窗口中按固定 seed 抽样最多 5 个 clip，再计算 TV-L1，避免把长视频的所有窗口都展开。脚本默认显示单个视频/clip 内部进度条；如果在日志系统里不想显示进度条，可以加 `--no-progress`。正式复现建议保留默认 `--flow-method tvl1`、`--clip-duration-sec 4.0`、`--clip-hop-sec 4.0`、`--visual-frame-count 50`；只做数据链路 smoke test 时，可临时用 `--flow-method farneback` 提速，但这不再是论文默认设置。
+
+`prepare-data -- process` 会跳过缺失视频，以及路径存在但 OpenCV/ffmpeg 无法打开的坏视频，并把这类 process 阶段问题写入：
+
+```text
+$DATA_ROOT/musices_process_failures.csv
+```
+
+如果遇到类似 `Unable to open video`，通常说明 mp4 文件存在但不可解码，常见原因是 YouTube 下载中断、下载失败后留下半成品、0 字节文件、权限/挂载异常或视频源失效。可先检查：
+
+```bash
+ls -lh "$DATA_ROOT/raw_videos/accordion/yy2vL2RUiPI.mp4"
+file "$DATA_ROOT/raw_videos/accordion/yy2vL2RUiPI.mp4"
+ffprobe -v error "$DATA_ROOT/raw_videos/accordion/yy2vL2RUiPI.mp4"
+```
+
+如果确认文件损坏，可以删除该 mp4 后重新运行下载；如果该 YouTube 视频已经不可下载，保留跳过即可，后续 `split-data` 只会收集成功处理出的样本。
+
+确认 TV-L1 可用：
+
+```bash
+python -c "import cv2; print(hasattr(cv2, 'optflow') or hasattr(cv2, 'DualTVL1OpticalFlow_create'))"
+```
+
+生成 AV split。该模式会要求每个样本同时存在 `mel.npy`、`raw_audio.npy`、`image_crop/`、`flow_x_crop/`、`flow_y_crop/`：
+
+```bash
+python main.py split-data -- --data-root "$DATA_ROOT"
+wc -l "$DATA_ROOT/train_new_split.txt" "$DATA_ROOT/val_new_split.txt" "$DATA_ROOT/test_new_split.txt"
+```
+
+本地单步 smoke test：
+
+```bash
+python main.py train-viai-av -- \
+  --data_root "$DATA_ROOT" \
+  --init_from_viai_a checkpoints/VIAI-A-PatchGAN_checkpoint_step000002000.pth.tar \
+  --checkpoint_dir /tmp/viai_av_smoke \
+  --log_event_path /tmp/viai_av_smoke/events \
+  --batch_size 1 \
+  --num_workers 0 \
+  --max_train_steps 1 \
+  --display_id 0 \
+  --print_freq 1
+```
+
+正式训练示例：
+
+```bash
+python main.py train-viai-av -- \
+  --data_root "$DATA_ROOT" \
+  --init_from_viai_a checkpoints/VIAI-A-PatchGAN_checkpoint_step000002000.pth.tar \
+  --batch_size 16 \
+  --num_workers 4 \
+  --beta_gan 0.1 \
+  --checkpoint_interval 1000 \
+  --print_freq 100 \
+  --display_id 0
+```
+
+如果不传 `--init_from_viai_a`，`train-viai-av` 会在 `--checkpoint_dir` 下寻找最新的 `VIAI-A-PatchGAN_checkpoint_step*.pth.tar`；找不到会直接报错，不会静默随机初始化音频侧。VIAI-AV checkpoint 命名格式为：
+
+```text
+checkpoints/VIAI-AV_checkpoint_step*.pth.tar
+```
+
+继续训练指定 VIAI-AV checkpoint：
+
+```bash
+python main.py train-viai-av -- \
+  --resume \
+  --resume_path checkpoints/VIAI-AV_checkpoint_step000001000.pth.tar \
+  --data_root "$DATA_ROOT" \
+  --batch_size 16 \
+  --num_workers 4 \
+  --display_id 0
+```
+
+测试 VIAI-AV checkpoint：
+
+```bash
+python main.py test-viai-av -- \
+  --resume_path checkpoints/VIAI-AV_checkpoint_step000001000.pth.tar \
+  --data_root "$DATA_ROOT" \
+  --batch_size 16 \
+  --num_workers 4 \
+  --display_id 0 \
+  --results_dir checkpoints/viai_av_test_results
+```
+
+如果本地 smoke split 的 `test_new_split.txt` 为空，可以临时用训练 split 验证测试入口：
+
+```bash
+python main.py test-viai-av -- \
+  --resume_path /tmp/viai_av_smoke/VIAI-AV_checkpoint_step000000001.pth.tar \
+  --data_root "$DATA_ROOT" \
+  --test_split_name train_new_split.txt \
+  --batch_size 1 \
+  --num_workers 0 \
+  --display_id 0 \
+  --results_dir /tmp/viai_av_smoke_results
+```
+
+测试会输出 normalized Mel `[0, 1]` 上的 L1、PSNR、SSIM、GAN/reconstruction loss，并写入：
+
+```text
+checkpoints/viai_av_test_results/VIAI-AV_stepXXXXXXXXX_test.json
+checkpoints/viai_av_test_results/VIAI-AV_test_summary.csv
+checkpoints/viai_av_test_results/mel-image/stepXXXXXXXXX/*.png
+```
+
+TensorBoard：
+
+```bash
+tensorboard --logdir checkpoints/events_viai_av --port 6006
+```
 
 
 

@@ -9,8 +9,8 @@ import torch.backends.cudnn as cudnn
 from tqdm import tqdm
 
 import Options_inpainting
-from Data_loaders import viai_a_loader
-from Models.VIAI_A_inpainting import VIAIAModel
+from Data_loaders import audio_loader as av_loader
+from Models.VIAI_AV_inpainting import VIAIAVModel
 from utils.viai_a_metrics import compute_viai_a_metrics, save_mel_comparison_batch
 
 
@@ -27,6 +27,7 @@ RESULT_FIELDS = [
     "global_step",
     "global_epoch",
     "test_split_name",
+    "stage",
     "use_gan",
     "num_samples",
     "loss_total",
@@ -35,7 +36,6 @@ RESULT_FIELDS = [
     "loss_d",
     "eta1",
     "beta_gan",
-    "lambda_recon",
     "mel_l1_full",
     "mel_l1_missing",
     "psnr_full",
@@ -48,15 +48,11 @@ def _arg_was_passed(name):
     return any(arg == name or arg.startswith(name + "=") for arg in sys.argv[1:])
 
 
-def configure_viai_a_defaults():
+def configure_viai_av_defaults():
     if not _arg_was_passed("--name"):
-        hparams.name = "VIAI-A-PatchGAN" if getattr(hparams, "use_gan", False) else "VIAI-A"
-    if not _arg_was_passed("--train_split_name"):
-        hparams.train_split_name = "train_viai_a_split.txt"
-    if not _arg_was_passed("--val_split_name"):
-        hparams.val_split_name = "val_viai_a_split.txt"
-    if not _arg_was_passed("--test_split_name"):
-        hparams.test_split_name = "test_viai_a_split.txt"
+        hparams.name = "VIAI-AV"
+    if not _arg_was_passed("--results_dir"):
+        hparams.results_dir = "./checkpoints/viai_av_test_results"
 
 
 def checkpoint_step(path):
@@ -82,7 +78,7 @@ def resolve_checkpoint_path(resume_path, checkpoint_dir, name):
                 candidates.append(os.path.join(directory, filename))
     if not candidates:
         raise RuntimeError(
-            "No VIAI-A checkpoint found. Pass --resume_path or place a "
+            "No VIAI-AV checkpoint found. Pass --resume_path or place a "
             f"{name}_checkpoint_step*.pth.tar file under {checkpoint_dir}."
         )
     return sorted(candidates, key=lambda path: (checkpoint_step(path), os.path.getmtime(path)))[-1]
@@ -92,100 +88,6 @@ def format_step(step):
     if step is None or step < 0:
         return "unknown"
     return f"{step:09d}"
-
-
-def build_result_record(checkpoint_path, checkpoint_step_value, global_step, global_epoch, results):
-    return {
-        "checkpoint_path": os.path.abspath(checkpoint_path),
-        "checkpoint_step": int(checkpoint_step_value),
-        "global_step": int(global_step),
-        "global_epoch": int(global_epoch),
-        "test_split_name": hparams.test_split_name,
-        "use_gan": bool(getattr(hparams, "use_gan", False)),
-        "num_samples": int(results["num_samples"]),
-        "loss_total": float(results["loss_total"]),
-        "loss_recon": float(results["loss_recon"]),
-        "loss_g_gan": float(results["loss_g_gan"]),
-        "loss_d": float(results["loss_d"]),
-        "eta1": float(results["eta1"]),
-        "beta_gan": float(getattr(hparams, "beta_gan", 0.1)),
-        "lambda_recon": float(getattr(hparams, "lambda_recon", 1.0)),
-        "mel_l1_full": float(results["mel_l1_full"]),
-        "mel_l1_missing": float(results["mel_l1_missing"]),
-        "psnr_full": float(results["psnr_full"]),
-        "psnr_missing": float(results["psnr_missing"]),
-        "ssim": float(results["ssim"]),
-    }
-
-
-def coerce_csv_record(row):
-    record = {}
-    int_fields = {"checkpoint_step", "global_step", "global_epoch", "num_samples"}
-    float_fields = {
-        "loss_total",
-        "loss_recon",
-        "loss_g_gan",
-        "loss_d",
-        "eta1",
-        "beta_gan",
-        "lambda_recon",
-        "mel_l1_full",
-        "mel_l1_missing",
-        "psnr_full",
-        "psnr_missing",
-        "ssim",
-    }
-    for field in RESULT_FIELDS:
-        value = row.get(field, "")
-        if field in int_fields and value != "":
-            record[field] = int(value)
-        elif field in float_fields and value != "":
-            record[field] = float(value)
-        else:
-            record[field] = value
-    return record
-
-
-def write_result_files(record, results_dir, name):
-    os.makedirs(results_dir, exist_ok=True)
-    step_text = format_step(record["checkpoint_step"])
-    json_path = os.path.join(results_dir, f"{name}_step{step_text}_test.json")
-    csv_path = os.path.join(results_dir, f"{name}_test_summary.csv")
-
-    with open(json_path, "w", encoding="utf-8") as handle:
-        json.dump(record, handle, ensure_ascii=True, indent=2)
-        handle.write("\n")
-
-    records_by_step = {}
-    if os.path.exists(csv_path):
-        with open(csv_path, "r", encoding="utf-8", newline="") as handle:
-            reader = csv.DictReader(handle)
-            for row in reader:
-                if not row.get("checkpoint_step"):
-                    continue
-                old_record = coerce_csv_record(row)
-                records_by_step[int(old_record["checkpoint_step"])] = old_record
-
-    records_by_step[int(record["checkpoint_step"])] = record
-    sorted_records = [
-        records_by_step[step]
-        for step in sorted(records_by_step)
-    ]
-    with open(csv_path, "w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=RESULT_FIELDS)
-        writer.writeheader()
-        for item in sorted_records:
-            writer.writerow({field: item.get(field, "") for field in RESULT_FIELDS})
-
-    return json_path, csv_path
-
-
-def mel_image_output_dir(results_dir, checkpoint_step_value):
-    return os.path.join(
-        results_dir,
-        "mel-image",
-        f"step{format_step(checkpoint_step_value)}",
-    )
 
 
 def batch_metrics(model):
@@ -201,6 +103,14 @@ def batch_metrics(model):
         "ssim": metrics["ssim_full_sum"],
         "num_samples": metrics["num_samples"],
     }
+
+
+def mel_image_output_dir(results_dir, checkpoint_step_value):
+    return os.path.join(
+        results_dir,
+        "mel-image",
+        f"step{format_step(checkpoint_step_value)}",
+    )
 
 
 def evaluate(model, data_loader, image_dir=None):
@@ -221,7 +131,7 @@ def evaluate(model, data_loader, image_dir=None):
 
     progress = tqdm(
         data_loader,
-        desc="[VIAI-A test] evaluating",
+        desc="[VIAI-AV test] evaluating",
         unit="batch",
         dynamic_ncols=True,
     )
@@ -249,27 +159,22 @@ def evaluate(model, data_loader, image_dir=None):
             save_mel_comparison_batch(
                 image_dir,
                 sample_count - batch_size,
-                data["path"],
+                model.path_batch,
                 model.mel_input_4d,
                 model.mel_pred,
                 model.mel_target_4d,
-                model.missing_mask,
             )
-        postfix = {
-            "loss": f"{model.loss_total_item:.4f}",
-            "full_l1": f"{model.loss_full_l1_item:.4f}",
-            "missing_l1": f"{model.loss_missing_l1_item:.4f}",
-            "psnr": f"{metrics['full_psnr'] / batch_size:.2f}",
-            "ssim": f"{metrics['ssim'] / batch_size:.4f}",
-        }
-        if model.use_gan:
-            postfix["g_gan"] = f"{model.loss_G_GAN_item:.4f}"
-            postfix["d"] = f"{model.loss_D_item:.4f}"
-        progress.set_postfix(**postfix)
+        progress.set_postfix(
+            loss=f"{model.loss_total_item:.4f}",
+            recon=f"{model.loss_recon_item:.4f}",
+            g_gan=f"{model.loss_G_GAN_item:.4f}",
+            d=f"{model.loss_D_item:.4f}",
+            psnr=f"{metrics['full_psnr'] / batch_size:.2f}",
+            ssim=f"{metrics['ssim'] / batch_size:.4f}",
+        )
 
     if batch_count == 0:
-        raise RuntimeError("VIAI-A test dataloader is empty.")
-
+        raise RuntimeError("VIAI-AV test dataloader is empty.")
     return {
         "loss_total": totals["loss_total"] / batch_count,
         "loss_recon": totals["loss_recon"] / batch_count,
@@ -285,18 +190,102 @@ def evaluate(model, data_loader, image_dir=None):
     }
 
 
+def build_result_record(checkpoint_path, checkpoint_step_value, global_step, global_epoch, results):
+    return {
+        "checkpoint_path": os.path.abspath(checkpoint_path),
+        "checkpoint_step": int(checkpoint_step_value),
+        "global_step": int(global_step),
+        "global_epoch": int(global_epoch),
+        "test_split_name": hparams.test_split_name,
+        "stage": "VIAI-AV-stage3",
+        "use_gan": True,
+        "num_samples": int(results["num_samples"]),
+        "loss_total": float(results["loss_total"]),
+        "loss_recon": float(results["loss_recon"]),
+        "loss_g_gan": float(results["loss_g_gan"]),
+        "loss_d": float(results["loss_d"]),
+        "eta1": float(results["eta1"]),
+        "beta_gan": float(getattr(hparams, "beta_gan", 0.1)),
+        "mel_l1_full": float(results["mel_l1_full"]),
+        "mel_l1_missing": float(results["mel_l1_missing"]),
+        "psnr_full": float(results["psnr_full"]),
+        "psnr_missing": float(results["psnr_missing"]),
+        "ssim": float(results["ssim"]),
+    }
+
+
+def coerce_csv_record(row):
+    record = {}
+    int_fields = {"checkpoint_step", "global_step", "global_epoch", "num_samples"}
+    float_fields = {
+        "loss_total",
+        "loss_recon",
+        "loss_g_gan",
+        "loss_d",
+        "eta1",
+        "beta_gan",
+        "mel_l1_full",
+        "mel_l1_missing",
+        "psnr_full",
+        "psnr_missing",
+        "ssim",
+    }
+    for field in RESULT_FIELDS:
+        value = row.get(field, "")
+        if field in int_fields and value != "":
+            record[field] = int(value)
+        elif field in float_fields and value != "":
+            record[field] = float(value)
+        else:
+            record[field] = value
+    return record
+
+
+def write_result_files(record, results_dir, name):
+    os.makedirs(results_dir, exist_ok=True)
+    step_text = format_step(record["checkpoint_step"])
+    json_path = os.path.join(results_dir, f"{name}_step{step_text}_test.json")
+    csv_path = os.path.join(results_dir, f"{name}_test_summary.csv")
+    with open(json_path, "w", encoding="utf-8") as handle:
+        json.dump(record, handle, ensure_ascii=True, indent=2)
+        handle.write("\n")
+
+    records_by_step = {}
+    if os.path.exists(csv_path):
+        with open(csv_path, "r", encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle)
+            for row in reader:
+                if not row.get("checkpoint_step"):
+                    continue
+                old_record = coerce_csv_record(row)
+                records_by_step[int(old_record["checkpoint_step"])] = old_record
+    records_by_step[int(record["checkpoint_step"])] = record
+    sorted_records = [records_by_step[step] for step in sorted(records_by_step)]
+    with open(csv_path, "w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=RESULT_FIELDS)
+        writer.writeheader()
+        for item in sorted_records:
+            writer.writerow({field: item.get(field, "") for field in RESULT_FIELDS})
+    return json_path, csv_path
+
+
 def main():
-    configure_viai_a_defaults()
-    data_loaders = viai_a_loader.get_data_loaders(hparams.data_root, phases=("test",))
+    configure_viai_av_defaults()
+    data_loaders = av_loader.get_data_loaders(
+        hparams.data_root,
+        hparams.speaker_id,
+        test_shuffle=False,
+        phases=("test",),
+    )
     if "test" not in data_loaders:
         raise RuntimeError(
-            f"VIAI-A test split is missing or empty: {os.path.join(hparams.data_root, hparams.test_split_name)}"
+            f"VIAI-AV test split is missing or empty: {os.path.join(hparams.data_root, hparams.test_split_name)}"
         )
 
-    model = VIAIAModel(hparams, device=device)
+    model = VIAIAVModel(hparams, device=device)
     checkpoint_path = resolve_checkpoint_path(hparams.resume_path, hparams.checkpoint_dir, hparams.name)
     global_step, global_epoch = model.load_checkpoint(checkpoint_path, reset_optimizer=True)
-    print(f"[VIAI-A test] loaded checkpoint: {checkpoint_path} (step={global_step}, epoch={global_epoch})")
+    print(f"[VIAI-AV test] loaded checkpoint: {checkpoint_path} (step={global_step}, epoch={global_epoch})")
 
     checkpoint_step_value = checkpoint_step(checkpoint_path)
     if checkpoint_step_value < 0:
@@ -316,7 +305,7 @@ def main():
         hparams.name,
     )
     print(
-        "[VIAI-A test] "
+        "[VIAI-AV test] "
         f"samples={results['num_samples']} "
         f"loss={results['loss_total']:.6f} "
         f"recon={results['loss_recon']:.6f} "
@@ -329,9 +318,9 @@ def main():
         f"psnr_missing={results['psnr_missing']:.3f} "
         f"ssim={results['ssim']:.4f}"
     )
-    print(f"[VIAI-A test] wrote json: {json_path}")
-    print(f"[VIAI-A test] wrote summary csv: {csv_path}")
-    print(f"[VIAI-A test] wrote mel images: {image_dir}")
+    print(f"[VIAI-AV test] wrote json: {json_path}")
+    print(f"[VIAI-AV test] wrote summary csv: {csv_path}")
+    print(f"[VIAI-AV test] wrote mel images: {image_dir}")
 
 
 if __name__ == "__main__":

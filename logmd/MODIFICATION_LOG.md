@@ -751,6 +751,54 @@ PNG mode 检查已通过：
 RGB (812, 98) checkpoints/viai_a_test_results/mel-image/step000000001/000000_processed_accordion_A2p8VW61RGc.png
 ```
 
+### 本次实际验证结果
+静态检查已通过：
+```bash
+.venv/bin/python -m py_compile utils/viai_a_metrics.py test_viai_a.py
+```
+
+VIAI-A 测试 smoke test 已通过：
+```bash
+.venv/bin/python main.py test-viai-a -- --data_root data --resume_path ./checkpoints/VIAI-A_checkpoint_step000000001.pth.tar --test_split_name train_viai_a_split.txt --batch_size 1 --num_workers 0 --display_id 0 --results_dir checkpoints/viai_a_test_results
+```
+
+PNG mode 检查已通过：
+```bash
+.venv/bin/python -c "from PIL import Image; import glob; p=glob.glob('checkpoints/viai_a_test_results/mel-image/step000000001/*.png')[0]; img=Image.open(p); print(img.mode, img.size, p)"
+```
+
+关键输出：
+```text
+RGB (812, 98) checkpoints/viai_a_test_results/mel-image/step000000001/000000_processed_accordion_A2p8VW61RGc.png
+```
+
+## 2026-05-03 VIAI-A 测试 Mel 四联图面板调整
+
+### 修改内容
+1. `utils/viai_a_metrics.py`
+   - `save_mel_comparison_png()` 的四联图从：
+     - masked input / prediction / target / abs error
+   - 改为：
+     - masked / interpolated / prediction / groundtruth
+   - `masked` 使用 `missing_mask` 将缺失区域置黑，便于肉眼确认缺失区。
+   - `interpolated` 保留当前模型实际输入，即边界插值后的 corrupted Mel。
+2. `test_viai_a.py`
+   - 调用 `save_mel_comparison_batch()` 时传入 `model.missing_mask`。
+3. `README.md`
+   - 更新测试 Mel PNG 四联图说明。
+
+### 验证命令
+```bash
+.venv/bin/python -m py_compile utils/viai_a_metrics.py test_viai_a.py
+.venv/bin/python main.py test-viai-a -- --data_root data --resume_path ./checkpoints/VIAI-A_checkpoint_step000000001.pth.tar --test_split_name train_viai_a_split.txt --batch_size 1 --num_workers 0 --display_id 0 --results_dir checkpoints/viai_a_test_results
+.venv/bin/python -c "from PIL import Image; import glob; p=glob.glob('checkpoints/viai_a_test_results/mel-image/step000000001/*.png')[0]; img=Image.open(p); print(img.mode, img.size, p)"
+```
+
+### 待记录 smoke test 关键输出
+```text
+RGB (...)
+```
+
 ## 2026-05-03 VIAI-A 第二阶段 PatchGAN
 
 ### 背景与目标
@@ -942,4 +990,133 @@ Saved VIAI-A checkpoint: /tmp/viai_patchgan_formula_smoke/VIAI-A-PatchGAN_checkp
 ```text
 [VIAI-A train] step=1 loss=0.560637 full_l1=0.289882 missing_l1=0.270755 eta1=1.000000 psnr=9.138 psnr_missing=9.589 ssim=0.009980
 Saved VIAI-A checkpoint: /tmp/viai_patchgan_formula_baseline/VIAI-A_checkpoint_step000000001.pth.tar
+```
+
+## 2026-05-03 VIAI-AV 第三阶段视频分支复现
+
+### 背景与目标
+根据 `information.md` 中“8.3 第三阶段：加入视频分支 VIAI-AV”的要求，本次只补齐视频条件分支，不加入 8.4 的 `contrastive sync loss`、`VIAI-AA' probe loss`、`η2(t)` 或 WaveNet。目标链路为：
+
+```text
+视频抽帧 -> TV-L1 光流 -> Image ResNet18 + Flow ResNet18 -> Efuse 时间融合 -> MelDecoderImage 融合解码
+```
+
+训练默认从第二阶段 `VIAI-A-PatchGAN` checkpoint 热启动音频侧权重，视觉分支随机初始化。
+
+### 本次修改内容
+1. `main.py`
+   - 新增 `train-viai-av -> train_viai_av`。
+   - 新增 `test-viai-av -> test_viai_av`。
+2. `base_options.py`
+   - 新增 `--init_from_viai_a`，用于从 `VIAI-A` 或 `VIAI-A-PatchGAN` checkpoint 初始化 Stage3 音频侧权重。
+   - 未显式传入时，`train-viai-av` 只自动寻找 `VIAI-A-PatchGAN_checkpoint_step*.pth.tar`；找不到会报错，不静默随机初始化。
+3. `Models/VIAI_AV_inpainting.py`
+   - 新增 `VIAIAVModel`，包含 `MelEncoder`、`ImageEmbedding`、`MelDecoderImage`、`MelDiscriminator`。
+   - 仅计算 reconstruction + GAN loss：
+```text
+loss_recon = eta1(t) * full_l1 + missing_l1
+loss_total = loss_g_gan + beta_gan * loss_recon
+loss_d = 0.5 * (loss_d_real + loss_d_fake)
+```
+   - 不计算 sync/probe loss。
+   - 从 VIAI-A checkpoint 部分加载 `Mel_Encoder`、`Mel_Decoder` 和可用的 `netD`。
+   - 使用 audio decoder stem 初始化 `MelDecoderImage` 的融合 stem。
+   - AV checkpoint 保存 `VideoEncoder`、`Mel_Encoder`、`Mel_Decoder`、`netD`、optimizer 和 step/epoch。
+4. `train_viai_av.py`
+   - 新增第三阶段训练入口，不使用旧 `Visualizer`，避免写入固定 `checkpoints/VIAI-AV/loss_log.txt`。
+   - TensorBoard 写入 `loss_total/loss_recon/loss_g_gan/loss_d/eta1/PSNR/SSIM/blank_frames/lr` 和 Mel 对比图。
+5. `test_viai_av.py`
+   - 新增第三阶段测试入口。
+   - 输出 normalized Mel `[0, 1]` 上的 L1、PSNR、SSIM、GAN/reconstruction loss。
+   - 写入 JSON、CSV 和 Mel RGB 热力图四联图。
+6. `networks/Image_Embedding.py`
+   - 修复 Efuse 中 `BN/ReLU` 调用未赋值的问题，两层 stride-2 1D conv 现在实际执行 `conv -> BN -> ReLU -> conv -> BN -> ReLU`。
+7. `networks/New_Inpainting_Networks.py`
+   - `MelDecoderImage.init_deconv_1_1_1()` 同步复制 bias，便于从 Stage2 decoder 初始化融合 stem。
+8. `Data_loaders/audio_loader.py`
+   - 修复 AV window 起点采样只受视频帧数约束的问题。
+   - 现在起点同时受 `mel.npy` 长度约束，避免 test 阶段随机采到视频末端导致 Mel/audio 越界。
+9. `utils/util.py`
+   - 旧 `save_inpainting_checkpoint()` 也会在模型存在 `VideoEncoder` 时保存视觉分支，避免旧 `main.py train` 路径丢失视频 encoder。
+10. `README.md`
+   - 新增“第三阶段：加入视频分支 VIAI-AV”完整操作流程。
+11. `checkpoints/VIAI-AV/loss_log.txt`
+   - 清理计划阶段探测命令追加的两行 smoke 日志，工作树不保留该探测副作用。
+
+### README 中记录的第三阶段命令
+```bash
+python main.py prepare-data -- process --json data/MUSICES.json --data-root data --skip-existing
+python main.py split-data -- --data-root data
+python main.py train-viai-av -- --data_root data --init_from_viai_a checkpoints/VIAI-A-PatchGAN_checkpoint_step000002000.pth.tar --batch_size 16 --num_workers 4 --beta_gan 0.1 --checkpoint_interval 1000 --print_freq 100 --display_id 0
+python main.py test-viai-av -- --resume_path checkpoints/VIAI-AV_checkpoint_step000001000.pth.tar --batch_size 16 --num_workers 4 --display_id 0 --results_dir checkpoints/viai_av_test_results
+```
+
+### 本次实际验证结果
+静态检查已通过：
+```bash
+.venv/bin/python -m py_compile main.py train_viai_av.py test_viai_av.py Models/VIAI_AV_inpainting.py Data_loaders/audio_loader.py networks/Image_Embedding.py networks/New_Inpainting_Networks.py utils/util.py
+```
+
+AV dataloader 与 Efuse 形状检查已通过：
+```text
+mel (1, 80, 200)
+video (1, 50, 3, 256, 256)
+flow (1, 50, 2, 256, 256)
+efuse (1, 256, 1, 13)
+```
+
+为 Stage3 smoke test 临时生成 `/tmp` 下的 Stage2 checkpoint 已通过：
+```bash
+.venv/bin/python main.py train-viai-a -- --use_gan --data_root data --checkpoint_dir /tmp/viai_av_stage3_patchgan_init --log_event_path /tmp/viai_av_stage3_patchgan_init/events --resume --resume_path checkpoints/VIAI-A_checkpoint_step000000001.pth.tar --reset_optimizer --batch_size 1 --num_workers 0 --max_train_steps 2 --display_id 0 --print_freq 1
+```
+
+关键输出：
+```text
+[VIAI-A train] step=2 loss=0.749014 full_l1=0.275098 missing_l1=0.233697 eta1=0.999895 recon=0.508765 g_gan=0.698137 d=0.710336 psnr=9.551 psnr_missing=10.769
+Saved VIAI-A checkpoint: /tmp/viai_av_stage3_patchgan_init/VIAI-A-PatchGAN_checkpoint_step000000002.pth.tar
+```
+
+VIAI-AV 训练 smoke test 已通过：
+```bash
+.venv/bin/python main.py train-viai-av -- --data_root data --init_from_viai_a /tmp/viai_av_stage3_patchgan_init/VIAI-A-PatchGAN_checkpoint_step000000002.pth.tar --checkpoint_dir /tmp/viai_av_smoke --log_event_path /tmp/viai_av_smoke/events --batch_size 1 --num_workers 0 --max_train_steps 1 --display_id 0 --print_freq 1
+```
+
+关键输出：
+```text
+[VIAI-AV] loaded 30 tensors into Mel_Encoder; skipped_shape=0
+[VIAI-AV] loaded 101 tensors into MelDecoderImage; skipped_shape=0
+[VIAI-AV] initialized MelDecoderImage fusion stem from audio decoder stem
+[VIAI-AV] loaded 25 tensors into MelDiscriminator; skipped_shape=0
+[VIAI-AV train] step=1 loss=0.810526 recon=0.521095 full_l1=0.259729 missing_l1=0.261366 g_gan=0.758417 d=0.693089 eta1=1.000000 psnr=10.241 psnr_missing=10.299 ssim=0.010216
+Saved VIAI-AV checkpoint: /tmp/viai_av_smoke/VIAI-AV_checkpoint_step000000001.pth.tar
+```
+
+VIAI-AV checkpoint 字段检查已通过，包含：
+```text
+Mel_Decoder, Mel_Encoder, VideoEncoder, global_epoch, global_step, netD, optimizer_D, optimizer_G, stage, use_gan
+```
+
+VIAI-AV 测试入口已通过。由于本地 smoke split 的 `test_new_split.txt` 为空，本次临时使用 `train_new_split.txt` 验证测试路径：
+```bash
+.venv/bin/python main.py test-viai-av -- --data_root data --resume_path /tmp/viai_av_smoke/VIAI-AV_checkpoint_step000000001.pth.tar --test_split_name train_new_split.txt --batch_size 1 --num_workers 0 --display_id 0 --results_dir /tmp/viai_av_smoke_results
+```
+
+关键输出：
+```text
+[VIAI-AV test] samples=1 loss=0.743333 recon=0.378604 g_gan=0.705472 d=0.690175 eta1=1.000000 mel_l1_full=0.221759 mel_l1_missing=0.156844 psnr_full=11.780 psnr_missing=14.807 ssim=0.1668
+[VIAI-AV test] wrote json: /tmp/viai_av_smoke_results/VIAI-AV_step000000001_test.json
+[VIAI-AV test] wrote summary csv: /tmp/viai_av_smoke_results/VIAI-AV_test_summary.csv
+[VIAI-AV test] wrote mel images: /tmp/viai_av_smoke_results/mel-image/step000000001
+```
+
+VIAI-A 第一/第二阶段入口回归已通过：
+```bash
+.venv/bin/python main.py train-viai-a -- --data_root data --checkpoint_dir /tmp/viai_av_stage3_regress_a --log_event_path /tmp/viai_av_stage3_regress_a/events --batch_size 1 --num_workers 0 --max_train_steps 1 --display_id 0 --print_freq 1
+.venv/bin/python main.py test-viai-a -- --data_root data --resume_path checkpoints/VIAI-A_checkpoint_step000000001.pth.tar --test_split_name train_viai_a_split.txt --batch_size 1 --num_workers 0 --display_id 0 --results_dir /tmp/viai_av_stage3_regress_a_results
+```
+
+关键输出：
+```text
+[VIAI-A train] step=1 loss=0.569536 full_l1=0.269511 missing_l1=0.300025 eta1=1.000000 psnr=9.682 psnr_missing=9.013 ssim=0.018781
+[VIAI-A test] samples=1 loss=0.337543 recon=0.337543 g_gan=0.000000 d=0.000000 eta1=1.000000 mel_l1_full=0.163488 mel_l1_missing=0.174055 psnr_full=13.548 psnr_missing=12.967 ssim=0.1415
 ```

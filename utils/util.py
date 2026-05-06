@@ -148,17 +148,20 @@ def save_inpainting_checkpoint(model, global_step, global_test_step, checkpoint_
         checkpoint_dir, hparams.name + "_checkpoint_step{:09d}.pth.tar".format(global_step))
     optimizer_G_state = model.optimizer_G.state_dict() if hparams.save_optimizer_state else None
     optimizer_D_state = model.optimizer_D.state_dict() if hparams.save_optimizer_state else None
-    torch.save({
+    checkpoint = {
         "Mel_Encoder": model.Mel_Encoder.state_dict(),
         "Mel_Decoder": model.Mel_Decoder.state_dict(),
         "netD": model.netD.state_dict(),
-        # "VideoEncoder": model.VideoEncoder.state_dict(),
         "optimizer_G": optimizer_G_state,
         "optimizer_D": optimizer_D_state,
         "global_step": global_step,
         "global_epoch": epoch,
         "global_test_step": global_test_step,
-    }, checkpoint_path)
+    }
+    video_encoder = getattr(model, "VideoEncoder", None)
+    if video_encoder is not None:
+        checkpoint["VideoEncoder"] = video_encoder.state_dict()
+    torch.save(checkpoint, checkpoint_path)
     print("Saved checkpoint:", checkpoint_path)
 
 

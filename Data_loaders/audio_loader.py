@@ -181,19 +181,38 @@ def sample_data_new(data_path, train=True, hparams=hparams):
     max_time_second = max_time_steps / hparams.sample_rate
 
     frame_stride = max(1, int(hparams.image_hope_size))
-    use_image_num = int(np.floor(max_time_second / (0.04 * frame_stride)))
+    visual_frame_count = int(getattr(hparams, "visual_frame_count", 0))
+    use_image_num = visual_frame_count if visual_frame_count > 0 else int(np.floor(max_time_second / (0.04 * frame_stride)))
     if use_image_num <= 0:
-        raise ValueError("use_image_num must be positive; check max_time_steps and image_hope_size")
+        raise ValueError("use_image_num must be positive; check max_time_steps, visual_frame_count, and image_hope_size")
 
     last_offset = (use_image_num - 1) * frame_stride
+    visual_frame_interval_sec = float(
+        getattr(hparams, "visual_frame_interval_sec", 0.04 * frame_stride)
+    )
+    mel_frames_per_visual_frame = visual_frame_interval_sec * hparams.sample_rate / hparams.hop_size
+    mel_window_frames = int(round(use_image_num * mel_frames_per_visual_frame))
+    mel_path = os.path.join(data_path, "mel.npy")
+    max_start_by_mel = None
+    if os.path.exists(mel_path):
+        mel_frames = int(np.load(mel_path, mmap_mode="r").shape[0])
+        max_start_by_mel = int(
+            np.floor((mel_frames - mel_window_frames) / mel_frames_per_visual_frame)
+        )
     min_start = 25
     max_start = num_images - 1 - last_offset - 25
+    if max_start_by_mel is not None:
+        max_start = min(max_start, max_start_by_mel)
     if max_start < min_start:
         min_start = 0
         max_start = num_images - 1 - last_offset
+        if max_start_by_mel is not None:
+            max_start = min(max_start, max_start_by_mel)
     if max_start < min_start:
         raise ValueError(
-            f"Not enough video frames in {data_path}: need {last_offset + 1}, found {num_images}"
+            f"Not enough aligned audio/video frames in {data_path}: "
+            f"need video_frames={last_offset + 1}, mel_frames={mel_window_frames}; "
+            f"found video_frames={num_images}"
         )
     start_candidates = np.arange(min_start, max_start + 1)
     image_start = int(np.random.choice(start_candidates))
@@ -478,9 +497,13 @@ def collate_fn(batch):
     max_time_second = max_time_steps / hparams.sample_rate
 
     frame_stride = max(1, int(hparams.image_hope_size))
-    use_image_num = int(np.floor(max_time_second / (0.04 * frame_stride)))
-    mel_frames_per_raw_video_frame = 0.04 * hparams.sample_rate / hparams.hop_size
-    mel_window_frames = int(round(use_image_num * frame_stride * mel_frames_per_raw_video_frame))
+    visual_frame_count = int(getattr(hparams, "visual_frame_count", 0))
+    use_image_num = visual_frame_count if visual_frame_count > 0 else int(np.floor(max_time_second / (0.04 * frame_stride)))
+    visual_frame_interval_sec = float(
+        getattr(hparams, "visual_frame_interval_sec", 0.04 * frame_stride)
+    )
+    mel_frames_per_visual_frame = visual_frame_interval_sec * hparams.sample_rate / hparams.hop_size
+    mel_window_frames = int(round(use_image_num * mel_frames_per_visual_frame))
     audio_window_steps = mel_window_frames * hparams.hop_size
     # Time resolution adjustment
     video_block = []
@@ -500,7 +523,7 @@ def collate_fn(batch):
                         )
 
                     for ln in range(hparams.load_num):
-                        mel_start = int(round(start[ln] * mel_frames_per_raw_video_frame))
+                        mel_start = int(round(start[ln] * mel_frames_per_visual_frame))
                         mel_end = mel_start + mel_window_frames
                         audio_start = mel_start * hparams.hop_size
                         audio_end = audio_start + audio_window_steps

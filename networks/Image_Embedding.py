@@ -119,8 +119,9 @@ class ImageEmbedding(nn.Module):
         fea_cat = torch.cat((image_out, flow_out), 2)
         fea_cat = torch.transpose(fea_cat, 2, 1)
         out = self.conv_1(fea_cat)
-        self.relu(self.bn_1(out))
+        out = self.relu(self.bn_1(out))
         out = self.conv_2(out)
+        out = self.relu(self.bn_2(out))
         out = out.unsqueeze(2)
         return out
 
@@ -144,8 +145,9 @@ class ImageEmbedding_single(nn.Module):
         image_out = image_out.view(video_block.size(0), -1, self.hparams.length_feature)
         image_out = image_out.transpose(1, 2)
         out = self.conv_1(image_out)
-        self.relu(self.bn_1(out))
+        out = self.relu(self.bn_1(out))
         out = self.conv_2(out)
+        out = self.relu(self.bn_2(out))
         return out
 
 class ImageEmbedding_finetune(nn.Module):

@@ -141,6 +141,8 @@ class MelDecoderImage(nn.Module):
         deconv1weight = self.deconv1_1.weight.unsqueeze(0)
         deconv1weight = deconv1weight.expand(2, 256, 256, 3, 3).contiguous()
         self.deconv1_1_1.weight.data = deconv1weight.view(512, 256, 3, 3)
+        if self.deconv1_1.bias is not None and self.deconv1_1_1.bias is not None:
+            self.deconv1_1_1.bias.data.copy_(self.deconv1_1.bias.data)
 
 
 class MelDecoderImage2(nn.Module):
@@ -195,6 +197,8 @@ class MelDecoderImage2(nn.Module):
         deconv1weight = self.deconv1_1.weight.unsqueeze(0)
         deconv1weight = deconv1weight.expand(2, 256, 256, 3, 3).contiguous()
         self.deconv1_1_1.weight.data = deconv1weight.view(512, 256, 3, 3)
+        if self.deconv1_1.bias is not None and self.deconv1_1_1.bias is not None:
+            self.deconv1_1_1.bias.data.copy_(self.deconv1_1.bias.data)
 
 
 
@@ -240,5 +244,4 @@ class MelDecoder_old(nn.Module):
         out = self.conv6_2(out)
         out = self.sig(out)
         return out
-
 

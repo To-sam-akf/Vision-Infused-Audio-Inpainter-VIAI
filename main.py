@@ -12,6 +12,8 @@ MODULE_MAP = {
     "split-data": "tools.split_musices",
     "train-viai-a": "train_viai_a",
     "test-viai-a": "test_viai_a",
+    "train-viai-av": "train_viai_av",
+    "test-viai-av": "test_viai_av",
 }
 
 

@@ -98,6 +98,45 @@ def parse_args():
     parser.add_argument("--frame-size", type=int, default=256)
     parser.add_argument("--frame-stride", type=int, default=1)
     parser.add_argument(
+        "--clip-duration-sec",
+        type=float,
+        default=4.0,
+        help="Duration of each AV training clip. The VIAI paper uses 4 seconds.",
+    )
+    parser.add_argument(
+        "--clip-hop-sec",
+        type=float,
+        default=4.0,
+        help="Hop size used to tile valid shots into AV clips. Default is non-overlapping 4-second windows.",
+    )
+    parser.add_argument(
+        "--clip-mel-frames",
+        type=int,
+        default=200,
+        help="Target Mel frame count per AV clip. The VIAI paper maps 4 seconds to an 80x200 spectrogram.",
+    )
+    parser.add_argument(
+        "--visual-frame-count",
+        type=int,
+        default=50,
+        help="Number of visual frames saved per AV clip. The VIAI paper maps 4 seconds to 50 video frames.",
+    )
+    parser.add_argument(
+        "--max-clips-per-segment",
+        type=int,
+        default=None,
+        help="Optional cap on the number of 4-second clips generated from each detected shot.",
+    )
+    parser.add_argument(
+        "--max-clips-per-video",
+        type=int,
+        default=None,
+        help=(
+            "Optional cap on the number of 4-second clips processed per source video. "
+            "When set, clips are sampled deterministically from all valid shot windows before TV-L1 is computed."
+        ),
+    )
+    parser.add_argument(
         "--trim-start-sec",
         type=float,
         default=6.0,
@@ -153,6 +192,19 @@ def parse_args():
         help="Optical-flow algorithm. VIAI paper uses TV-L1; Farneback is only for fallback smoke tests.",
     )
     parser.add_argument("--flow-clip", type=float, default=20.0)
+    parser.add_argument(
+        "--progress",
+        dest="progress",
+        action="store_true",
+        default=True,
+        help="Show per-video progress bars for shot detection, frame reading, TV-L1 flow, and cropping.",
+    )
+    parser.add_argument(
+        "--no-progress",
+        dest="progress",
+        action="store_false",
+        help="Disable per-video progress bars.",
+    )
     parser.add_argument("--skip-download", action="store_true")
     parser.add_argument("--skip-existing", action="store_true")
     parser.add_argument("--abort-on-download-error", action="store_true")
@@ -180,9 +232,72 @@ def require_cv2():
     except ModuleNotFoundError as exc:
         raise RuntimeError(
             "OpenCV is required for frame and optical-flow extraction. "
-            "Install it with `uv add opencv-python && uv sync`."
+            "Install opencv-contrib-python-headless so mp4 decoding and TV-L1 "
+            "optical flow are both available."
         ) from exc
     return cv2
+
+
+def cv2_has_video_backend(cv2):
+    try:
+        build_info = cv2.getBuildInformation()
+    except Exception:
+        return True
+    for line in build_info.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("FFMPEG:") or stripped.startswith("GStreamer:"):
+            value = stripped.split(":", 1)[1].strip().upper()
+            if value.startswith("YES"):
+                return True
+    return False
+
+
+def ensure_cv2_video_backend(cv2):
+    if cv2_has_video_backend(cv2):
+        return
+    raise RuntimeError(
+        "OpenCV was imported, but this build has no FFMPEG/GStreamer video backend. "
+        "cv2.VideoCapture cannot decode mp4 files in this environment. Reinstall "
+        "OpenCV in the same Python environment, for example: "
+        "`python -m pip uninstall -y opencv-python opencv-python-headless "
+        "opencv-contrib-python opencv-contrib-python-headless`, remove any leftover "
+        "`cv2/` package directory if pip reports it is not empty, then install "
+        "`python -m pip install --no-cache-dir numpy==1.22.4 "
+        "opencv-contrib-python-headless==4.10.0.84`."
+    )
+
+
+class NullProgress:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        self.close()
+        return False
+
+    def update(self, amount=1):
+        return None
+
+    def close(self):
+        return None
+
+
+def make_progress(args, desc, total=None, unit="it"):
+    if not getattr(args, "progress", True):
+        return NullProgress()
+    try:
+        from tqdm import tqdm
+    except ModuleNotFoundError:
+        return NullProgress()
+    if total is not None and total <= 0:
+        return NullProgress()
+    return tqdm(
+        total=total,
+        desc=desc,
+        unit=unit,
+        dynamic_ncols=True,
+        leave=False,
+    )
 
 
 def require_librosa():
@@ -263,6 +378,10 @@ def download_failure_path(data_root):
     return Path(data_root) / "musices_download_failures.csv"
 
 
+def process_failure_path(data_root):
+    return Path(data_root) / "musices_process_failures.csv"
+
+
 def resolved_video_root(data_root, video_dir, video_root=None):
     if video_root is not None:
         return Path(video_root)
@@ -281,6 +400,12 @@ def segment_output_dir(data_root, processed_dir, record, segment_id):
     if segment_id is None:
         return sample_output_dir(data_root, processed_dir, record)
     return sample_output_dir(data_root, processed_dir, record) / f"shot_{segment_id:06d}"
+
+
+def clip_output_dir(data_root, processed_dir, record, segment_id, clip_id):
+    if segment_id is None:
+        return sample_output_dir(data_root, processed_dir, record) / f"clip_{clip_id:06d}"
+    return segment_output_dir(data_root, processed_dir, record, segment_id) / f"clip_{clip_id:06d}"
 
 
 def video_url(record):
@@ -802,6 +927,25 @@ def write_download_failures(data_root, failures):
     return output
 
 
+def write_process_failures(data_root, failures):
+    output = process_failure_path(data_root)
+    ensure_dir(output.parent)
+    with output.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                "sample_key",
+                "status",
+                "video_path",
+                "error_message",
+            ],
+        )
+        writer.writeheader()
+        for failure in failures:
+            writer.writerow(failure)
+    return output
+
+
 def normalize_spectrogram(spectrogram, min_level_db):
     np = require_numpy()
     return np.clip((spectrogram - min_level_db) / -min_level_db, 0.0, 1.0)
@@ -845,6 +989,19 @@ def align_waveform_length(wav, mel_frames, hop_size):
     return wav.astype(np.float32)
 
 
+def fit_mel_frame_count(mel, target_frames):
+    np = require_numpy()
+    if target_frames is None or target_frames <= 0:
+        return mel
+    target_frames = int(target_frames)
+    if mel.shape[0] > target_frames:
+        return mel[:target_frames]
+    if mel.shape[0] < target_frames:
+        padding = np.zeros((target_frames - mel.shape[0], mel.shape[1]), dtype=mel.dtype)
+        return np.concatenate([mel, padding], axis=0)
+    return mel
+
+
 def export_audio_and_mel(sample_dir, wav_path, args):
     np = require_numpy()
     librosa = require_librosa()
@@ -863,6 +1020,7 @@ def export_audio_and_mel(sample_dir, wav_path, args):
         min_level_db=args.min_level_db,
         ref_level_db=args.ref_level_db,
     )
+    mel = fit_mel_frame_count(mel, getattr(args, "clip_mel_frames", None))
     wav = align_waveform_length(wav, mel.shape[0], args.hop_size)
 
     np.save(sample_dir / "raw_audio.npy", wav.astype(np.float32), allow_pickle=False)
@@ -900,7 +1058,7 @@ def video_duration_and_fps(video_path):
     return float(duration), float(fps)
 
 
-def detect_video_segments(video_path, args):
+def detect_video_segments(video_path, args, label=None):
     cv2 = require_cv2()
     np = require_numpy()
     duration, fps = video_duration_and_fps(video_path)
@@ -920,23 +1078,27 @@ def detect_video_segments(video_path, args):
     segment_start = start_sec
     segments = []
     frame_index = start_frame
+    total_frames = max(0, int(round((duration - start_sec) * fps)))
+    progress_label = label if label is not None else video_path.stem
 
-    while True:
-        ok, frame = cap.read()
-        if not ok:
-            break
-        timestamp = frame_index / fps
-        if timestamp >= duration:
-            break
-        gray = cv2.cvtColor(cv2.resize(frame, (64, 64)), cv2.COLOR_BGR2GRAY)
-        if previous_gray is not None:
-            diff = float(np.mean(np.abs(gray.astype(np.float32) - previous_gray.astype(np.float32))))
-            if diff >= args.shot_diff_threshold:
-                if timestamp - segment_start >= args.min_segment_sec:
-                    segments.append((segment_start, timestamp - segment_start))
-                segment_start = timestamp
-        previous_gray = gray
-        frame_index += 1
+    with make_progress(args, f"{progress_label} shot-detect", total=total_frames, unit="frame") as progress:
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            timestamp = frame_index / fps
+            if timestamp >= duration:
+                break
+            gray = cv2.cvtColor(cv2.resize(frame, (64, 64)), cv2.COLOR_BGR2GRAY)
+            if previous_gray is not None:
+                diff = float(np.mean(np.abs(gray.astype(np.float32) - previous_gray.astype(np.float32))))
+                if diff >= args.shot_diff_threshold:
+                    if timestamp - segment_start >= args.min_segment_sec:
+                        segments.append((segment_start, timestamp - segment_start))
+                    segment_start = timestamp
+            previous_gray = gray
+            frame_index += 1
+            progress.update(1)
 
     cap.release()
     if duration - segment_start >= args.min_segment_sec:
@@ -944,7 +1106,7 @@ def detect_video_segments(video_path, args):
     return segments
 
 
-def black_frame_ratio(video_path, start_sec, duration_sec, args, sample_stride_frames=25):
+def black_frame_ratio(video_path, start_sec, duration_sec, args, sample_stride_frames=25, label=None):
     cv2 = require_cv2()
     np = require_numpy()
     _, fps = video_duration_and_fps(video_path)
@@ -954,22 +1116,26 @@ def black_frame_ratio(video_path, start_sec, duration_sec, args, sample_stride_f
 
     start_frame = int(round(start_sec * fps))
     end_frame = int(round((start_sec + duration_sec) * fps))
-    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
-    frame_index = start_frame
     sampled = 0
     black = 0
     stride = max(1, sample_stride_frames)
+    progress_label = label if label is not None else video_path.stem
+    frame_indices = list(range(start_frame, max(start_frame, end_frame), stride))
 
-    while frame_index < end_frame:
-        ok, frame = cap.read()
-        if not ok:
-            break
-        if (frame_index - start_frame) % stride == 0:
+    with make_progress(args, f"{progress_label} black-check", total=len(frame_indices), unit="sample") as progress:
+        for frame_index in frame_indices:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+            ok, frame = cap.read()
+            if not ok:
+                progress.update(1)
+                continue
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             sampled += 1
             if float(np.mean(gray)) <= args.black_frame_threshold:
                 black += 1
-        frame_index += 1
+            progress.update(1)
+            if frame_index >= end_frame:
+                break
 
     cap.release()
     if sampled == 0:
@@ -1020,8 +1186,11 @@ def extract_frames_and_flow(
     frame_stride,
     flow_clip,
     flow_method,
+    target_frame_count=None,
     start_sec=0.0,
     duration_sec=None,
+    args=None,
+    label=None,
 ):
     cv2 = require_cv2()
     np = require_numpy()
@@ -1046,15 +1215,39 @@ def extract_frames_and_flow(
 
     frames = []
     frame_index = start_frame
-    while True:
-        if end_frame is not None and frame_index >= end_frame:
-            break
-        ok, frame = cap.read()
-        if not ok:
-            break
-        if (frame_index - start_frame) % max(frame_stride, 1) == 0:
-            frames.append(cv2.resize(frame, (frame_size, frame_size)))
-        frame_index += 1
+    frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+    if end_frame is not None:
+        total_read_frames = max(0, end_frame - start_frame)
+    elif frame_count and frame_count > start_frame:
+        total_read_frames = int(frame_count - start_frame)
+    else:
+        total_read_frames = None
+    selected_offsets = None
+    if target_frame_count is not None and target_frame_count > 0 and total_read_frames:
+        target_frame_count = min(int(target_frame_count), int(total_read_frames))
+        selected_offsets = set(
+            int(offset)
+            for offset in np.linspace(0, total_read_frames - 1, num=target_frame_count).round()
+        )
+    progress_args = args if args is not None else argparse.Namespace(progress=False)
+    progress_label = label if label is not None else video_path.stem
+
+    with make_progress(progress_args, f"{progress_label} read-frames", total=total_read_frames, unit="frame") as progress:
+        while True:
+            if end_frame is not None and frame_index >= end_frame:
+                break
+            ok, frame = cap.read()
+            if not ok:
+                break
+            offset = frame_index - start_frame
+            if selected_offsets is not None:
+                should_keep = offset in selected_offsets
+            else:
+                should_keep = offset % max(frame_stride, 1) == 0
+            if should_keep:
+                frames.append(cv2.resize(frame, (frame_size, frame_size)))
+            frame_index += 1
+            progress.update(1)
     cap.release()
 
     if len(frames) < 2:
@@ -1063,19 +1256,21 @@ def extract_frames_and_flow(
     previous_gray = None
     zero_flow = np.full((frame_size, frame_size), 127, dtype=np.uint8)
     tvl1_estimator = create_tvl1_flow_estimator(cv2) if flow_method == "tvl1" else None
-    for frame_id, frame in enumerate(frames, start=1):
-        cv2.imwrite(str(image_dir / f"{frame_id}.jpg"), frame)
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        if previous_gray is None:
-            flow_x = zero_flow
-            flow_y = zero_flow
-        else:
-            flow = compute_optical_flow(cv2, previous_gray, gray, flow_method, tvl1_estimator)
-            flow_x = normalize_flow_component(flow[..., 0], flow_clip)
-            flow_y = normalize_flow_component(flow[..., 1], flow_clip)
-        cv2.imwrite(str(flow_x_dir / f"{frame_id}.jpg"), flow_x)
-        cv2.imwrite(str(flow_y_dir / f"{frame_id}.jpg"), flow_y)
-        previous_gray = gray
+    with make_progress(progress_args, f"{progress_label} {flow_method}-flow", total=len(frames), unit="frame") as progress:
+        for frame_id, frame in enumerate(frames, start=1):
+            cv2.imwrite(str(image_dir / f"{frame_id}.jpg"), frame)
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            if previous_gray is None:
+                flow_x = zero_flow
+                flow_y = zero_flow
+            else:
+                flow = compute_optical_flow(cv2, previous_gray, gray, flow_method, tvl1_estimator)
+                flow_x = normalize_flow_component(flow[..., 0], flow_clip)
+                flow_y = normalize_flow_component(flow[..., 1], flow_clip)
+            cv2.imwrite(str(flow_x_dir / f"{frame_id}.jpg"), flow_x)
+            cv2.imwrite(str(flow_y_dir / f"{frame_id}.jpg"), flow_y)
+            previous_gray = gray
+            progress.update(1)
 
 
 def find_cluster(indices):
@@ -1113,7 +1308,7 @@ def padding_square(image):
     return cv2.copyMakeBorder(image, top, bottom, left, right, cv2.BORDER_CONSTANT, value=value)
 
 
-def compute_crop_bounds(sample_dir):
+def compute_crop_bounds(sample_dir, args=None, label=None):
     cv2 = require_cv2()
     np = require_numpy()
     flow_x_paths = sorted((sample_dir / "flow_x").glob("*.jpg"), key=lambda path: int(path.stem))
@@ -1122,17 +1317,22 @@ def compute_crop_bounds(sample_dir):
 
     sum_flow_x = None
     sum_flow_y = None
-    for flow_x_path in flow_x_paths:
-        frame_id = flow_x_path.stem
-        flow_y_path = sample_dir / "flow_y" / f"{frame_id}.jpg"
-        flow_x = cv2.imread(str(flow_x_path), 0)
-        flow_y = cv2.imread(str(flow_y_path), 0)
-        if flow_x is None or flow_y is None:
-            continue
-        diff_x = np.abs(flow_x.astype(np.int32) - 127)
-        diff_y = np.abs(flow_y.astype(np.int32) - 127)
-        sum_flow_x = diff_x if sum_flow_x is None else sum_flow_x + diff_x
-        sum_flow_y = diff_y if sum_flow_y is None else sum_flow_y + diff_y
+    progress_args = args if args is not None else argparse.Namespace(progress=False)
+    progress_label = label if label is not None else sample_dir.name
+    with make_progress(progress_args, f"{progress_label} crop-bounds", total=len(flow_x_paths), unit="frame") as progress:
+        for flow_x_path in flow_x_paths:
+            frame_id = flow_x_path.stem
+            flow_y_path = sample_dir / "flow_y" / f"{frame_id}.jpg"
+            flow_x = cv2.imread(str(flow_x_path), 0)
+            flow_y = cv2.imread(str(flow_y_path), 0)
+            if flow_x is None or flow_y is None:
+                progress.update(1)
+                continue
+            diff_x = np.abs(flow_x.astype(np.int32) - 127)
+            diff_y = np.abs(flow_y.astype(np.int32) - 127)
+            sum_flow_x = diff_x if sum_flow_x is None else sum_flow_x + diff_x
+            sum_flow_y = diff_y if sum_flow_y is None else sum_flow_y + diff_y
+            progress.update(1)
 
     if sum_flow_x is None or sum_flow_y is None:
         return None
@@ -1151,7 +1351,7 @@ def compute_crop_bounds(sample_dir):
     return int(w_min), int(w_max), int(h_min), int(h_max)
 
 
-def crop_motion_region(sample_dir):
+def crop_motion_region(sample_dir, args=None, label=None):
     cv2 = require_cv2()
     image_crop_dir = sample_dir / "image_crop"
     flow_x_crop_dir = sample_dir / "flow_x_crop"
@@ -1159,30 +1359,34 @@ def crop_motion_region(sample_dir):
     for directory in [image_crop_dir, flow_x_crop_dir, flow_y_crop_dir]:
         reset_directory(directory)
 
-    bounds = compute_crop_bounds(sample_dir)
+    progress_args = args if args is not None else argparse.Namespace(progress=False)
+    progress_label = label if label is not None else sample_dir.name
+    bounds = compute_crop_bounds(sample_dir, args=progress_args, label=progress_label)
     image_paths = sorted((sample_dir / "image").glob("*.jpg"), key=lambda path: int(path.stem))
     if not image_paths:
         raise RuntimeError(f"No extracted image frames found in {sample_dir}")
 
-    for image_path in image_paths:
-        frame_id = image_path.stem
-        image = cv2.imread(str(image_path))
-        flow_x = cv2.imread(str(sample_dir / "flow_x" / f"{frame_id}.jpg"), 0)
-        flow_y = cv2.imread(str(sample_dir / "flow_y" / f"{frame_id}.jpg"), 0)
+    with make_progress(progress_args, f"{progress_label} crop-write", total=len(image_paths), unit="frame") as progress:
+        for image_path in image_paths:
+            frame_id = image_path.stem
+            image = cv2.imread(str(image_path))
+            flow_x = cv2.imread(str(sample_dir / "flow_x" / f"{frame_id}.jpg"), 0)
+            flow_y = cv2.imread(str(sample_dir / "flow_y" / f"{frame_id}.jpg"), 0)
 
-        if bounds is not None:
-            w_min, w_max, h_min, h_max = bounds
-            image = image[h_min:h_max, w_min:w_max]
-            flow_x = flow_x[h_min:h_max, w_min:w_max]
-            flow_y = flow_y[h_min:h_max, w_min:w_max]
+            if bounds is not None:
+                w_min, w_max, h_min, h_max = bounds
+                image = image[h_min:h_max, w_min:w_max]
+                flow_x = flow_x[h_min:h_max, w_min:w_max]
+                flow_y = flow_y[h_min:h_max, w_min:w_max]
 
-        image = padding_square(image)
-        flow_x = padding_square(flow_x)
-        flow_y = padding_square(flow_y)
+            image = padding_square(image)
+            flow_x = padding_square(flow_x)
+            flow_y = padding_square(flow_y)
 
-        cv2.imwrite(str(image_crop_dir / f"{frame_id}.jpg"), image)
-        cv2.imwrite(str(flow_x_crop_dir / f"{frame_id}.jpg"), flow_x)
-        cv2.imwrite(str(flow_y_crop_dir / f"{frame_id}.jpg"), flow_y)
+            cv2.imwrite(str(image_crop_dir / f"{frame_id}.jpg"), image)
+            cv2.imwrite(str(flow_x_crop_dir / f"{frame_id}.jpg"), flow_x)
+            cv2.imwrite(str(flow_y_crop_dir / f"{frame_id}.jpg"), flow_y)
+            progress.update(1)
 
 
 def extract_audio_from_video(video_path, wav_path, ffmpeg_binary, skip_existing, start_sec=0.0, duration_sec=None):
@@ -1223,7 +1427,7 @@ def processed_sample_ready(sample_dir):
     return all(path.exists() for path in required_files) and all(path.exists() for path in required_dirs)
 
 
-def clean_legacy_flat_sample(sample_dir):
+def clean_direct_sample_payload(sample_dir):
     for name in [
         "source.wav",
         "raw_audio.npy",
@@ -1242,10 +1446,23 @@ def clean_legacy_flat_sample(sample_dir):
             path.unlink()
 
 
-def process_segment(record, args, ffmpeg_binary, segment_id, start_sec, duration_sec):
+def clean_legacy_flat_sample(sample_dir):
+    clean_direct_sample_payload(sample_dir)
+    if not sample_dir.exists():
+        return
+    for shot_dir in sample_dir.glob("shot_*"):
+        if shot_dir.is_dir():
+            clean_direct_sample_payload(shot_dir)
+
+
+def process_clip(record, args, ffmpeg_binary, segment_id, clip_id, start_sec, duration_sec):
     data_root = Path(args.data_root)
     video_path = video_output_path(data_root, args.video_dir, record, args.video_root)
-    sample_dir = segment_output_dir(data_root, args.processed_dir, record, segment_id)
+    sample_dir = clip_output_dir(data_root, args.processed_dir, record, segment_id, clip_id)
+    label = (
+        f"{record['sample_key']} shot{segment_id if segment_id is not None else 0} "
+        f"clip{clip_id}"
+    )
 
     if args.skip_existing and processed_sample_ready(sample_dir):
         return {
@@ -1273,7 +1490,7 @@ def process_segment(record, args, ffmpeg_binary, segment_id, start_sec, duration
             "status": "skipped_silent",
         }
 
-    black_ratio = black_frame_ratio(video_path, start_sec, duration_sec, args)
+    black_ratio = black_frame_ratio(video_path, start_sec, duration_sec, args, label=label)
     if black_ratio >= args.max_black_ratio:
         shutil.rmtree(sample_dir)
         return {
@@ -1289,10 +1506,13 @@ def process_segment(record, args, ffmpeg_binary, segment_id, start_sec, duration
         frame_stride=args.frame_stride,
         flow_clip=args.flow_clip,
         flow_method=args.flow_method,
+        target_frame_count=args.visual_frame_count,
         start_sec=start_sec,
         duration_sec=duration_sec,
+        args=args,
+        label=label,
     )
-    crop_motion_region(sample_dir)
+    crop_motion_region(sample_dir, args=args, label=label)
     mel_frames = export_audio_and_mel(sample_dir, wav_path, args)
     return {
         "sample_dir": sample_dir,
@@ -1301,51 +1521,107 @@ def process_segment(record, args, ffmpeg_binary, segment_id, start_sec, duration
     }
 
 
+def iter_clip_windows(segments, args):
+    clip_duration = float(args.clip_duration_sec)
+    if clip_duration <= 0:
+        raise RuntimeError(f"--clip-duration-sec must be positive, got {args.clip_duration_sec}")
+    clip_hop = float(args.clip_hop_sec)
+    if clip_hop <= 0:
+        raise RuntimeError(f"--clip-hop-sec must be positive, got {args.clip_hop_sec}")
+    if args.max_clips_per_segment is not None and args.max_clips_per_segment <= 0:
+        raise RuntimeError(
+            f"--max-clips-per-segment must be positive when set, got {args.max_clips_per_segment}"
+        )
+
+    for segment_index, (segment_start, segment_duration) in enumerate(segments):
+        if segment_duration + 1e-6 < clip_duration:
+            continue
+        segment_end = segment_start + segment_duration
+        clip_index = 0
+        clip_start = segment_start
+        while clip_start + clip_duration <= segment_end + 1e-6:
+            yield segment_index, clip_index, clip_start, clip_duration, segment_start, segment_duration
+            clip_index += 1
+            if args.max_clips_per_segment is not None and clip_index >= args.max_clips_per_segment:
+                break
+            clip_start = segment_start + clip_index * clip_hop
+
+
+def sample_clip_windows_for_video(record, args, clip_windows):
+    max_clips = args.max_clips_per_video
+    if max_clips is None:
+        return clip_windows
+    if max_clips <= 0:
+        raise RuntimeError(f"--max-clips-per-video must be positive when set, got {max_clips}")
+    if len(clip_windows) <= max_clips:
+        return clip_windows
+
+    rng = random.Random(f"{args.seed}:{record['sample_key']}")
+    selected_indices = sorted(rng.sample(range(len(clip_windows)), max_clips))
+    return [clip_windows[index] for index in selected_indices]
+
+
 def process_record(record, args, ffmpeg_binary):
     data_root = Path(args.data_root)
     video_path = video_output_path(data_root, args.video_dir, record, args.video_root)
     root_sample_dir = sample_output_dir(data_root, args.processed_dir, record)
+    segments = detect_video_segments(video_path, args, label=record["sample_key"])
+    if not segments:
+        return {"status": "no_segments", "processed": 0, "skipped": 0}
+
     if args.shot_detection:
         ensure_dir(root_sample_dir)
         clean_legacy_flat_sample(root_sample_dir)
 
-    segments = detect_video_segments(video_path, args)
-    if not segments:
-        return {"status": "no_segments", "processed": 0, "skipped": 0}
+    candidate_clip_windows = list(iter_clip_windows(segments, args))
+    clip_windows = sample_clip_windows_for_video(record, args, candidate_clip_windows)
+    if not clip_windows:
+        return {"status": "no_clip_windows", "processed": 0, "skipped": 0}
+    if len(clip_windows) < len(candidate_clip_windows):
+        print(
+            f"[prepare_musices] clip sampling: {record['sample_key']} "
+            f"selected={len(clip_windows)} candidates={len(candidate_clip_windows)} "
+            f"max_clips_per_video={args.max_clips_per_video}"
+        )
 
     processed = 0
     skipped = 0
-    for segment_index, (start_sec, duration_sec) in enumerate(segments):
+    for segment_index, clip_index, start_sec, duration_sec, segment_start, segment_duration in clip_windows:
         segment_id = segment_index if args.shot_detection else None
         try:
-            result = process_segment(
+            result = process_clip(
                 record,
                 args,
                 ffmpeg_binary,
                 segment_id,
+                clip_index,
                 start_sec,
                 duration_sec,
             )
         except RuntimeError as exc:
             skipped += 1
             print(
-                f"[prepare_musices] segment skipped: {record['sample_key']} "
-                f"segment={segment_index} start={start_sec:.2f}s duration={duration_sec:.2f}s | {exc}"
+                f"[prepare_musices] clip skipped: {record['sample_key']} "
+                f"segment={segment_index} clip={clip_index} "
+                f"clip_start={start_sec:.2f}s clip_duration={duration_sec:.2f}s "
+                f"segment_start={segment_start:.2f}s segment_duration={segment_duration:.2f}s | {exc}"
             )
             continue
 
         if result["status"] == "processed":
             processed += 1
             print(
-                f"[prepare_musices] segment processed: {record['sample_key']} "
-                f"segment={segment_index} start={start_sec:.2f}s duration={duration_sec:.2f}s "
+                f"[prepare_musices] clip processed: {record['sample_key']} "
+                f"segment={segment_index} clip={clip_index} "
+                f"clip_start={start_sec:.2f}s clip_duration={duration_sec:.2f}s "
                 f"mel_frames={result['mel_frames']}"
             )
         else:
             skipped += 1
             print(
-                f"[prepare_musices] segment {result['status']}: {record['sample_key']} "
-                f"segment={segment_index} start={start_sec:.2f}s duration={duration_sec:.2f}s"
+                f"[prepare_musices] clip {result['status']}: {record['sample_key']} "
+                f"segment={segment_index} clip={clip_index} "
+                f"clip_start={start_sec:.2f}s clip_duration={duration_sec:.2f}s"
             )
     return {"status": "processed" if processed else "no_valid_segments", "processed": processed, "skipped": skipped}
 
@@ -1521,18 +1797,50 @@ def main():
             return
 
     if args.action in {"process", "all"}:
+        cv2 = require_cv2()
+        ensure_cv2_video_backend(cv2)
         ffmpeg_binary = resolve_ffmpeg_binary(args.ffmpeg_bin)
+        process_failures = []
         for index, record in enumerate(records, start=1):
             video_path = video_output_path(data_root, args.video_dir, record, args.video_root)
             if not video_path.exists():
                 print(f"[prepare_musices] skip missing video {record['sample_key']}: {video_path}")
+                process_failures.append(
+                    {
+                        "sample_key": record["sample_key"],
+                        "status": "missing_video",
+                        "video_path": str(video_path),
+                        "error_message": "video file does not exist",
+                    }
+                )
                 continue
             print(f"[prepare_musices] processing {index}/{len(records)}: {record['sample_key']}")
-            result = process_record(record, args, ffmpeg_binary)
+            try:
+                result = process_record(record, args, ffmpeg_binary)
+            except RuntimeError as exc:
+                status = "unreadable_video" if "Unable to open video" in str(exc) else "process_error"
+                print(
+                    f"[prepare_musices] skip unreadable/invalid video {record['sample_key']}: "
+                    f"{video_path} | {exc}"
+                )
+                process_failures.append(
+                    {
+                        "sample_key": record["sample_key"],
+                        "status": status,
+                        "video_path": str(video_path),
+                        "error_message": str(exc),
+                    }
+                )
+                continue
             print(
                 f"[prepare_musices] process summary: {record['sample_key']} | "
                 f"status={result['status']} processed={result['processed']} skipped={result['skipped']}"
             )
+        failure_output = write_process_failures(data_root, process_failures)
+        print(
+            f"[prepare_musices] process failure summary: "
+            f"failures={len(process_failures)}, failure_log={failure_output}"
+        )
         if args.action == "process":
             return
 

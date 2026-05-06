@@ -1,2 +1,2 @@
-checkpoint_path,checkpoint_step,global_step,global_epoch,test_split_name,num_samples,loss_total,mel_l1_full,mel_l1_missing,psnr_full,psnr_missing,ssim
-/home/sanmu/Vision-Infused-Audio-Inpainter-VIAI/checkpoints/VIAI-A_checkpoint_step000000001.pth.tar,1,1,0,train_viai_a_split.txt,1,0.3577202558517456,0.16349591314792633,0.19422432780265808,13.546332359313965,12.158605575561523,0.14162675019317064
+checkpoint_path,checkpoint_step,global_step,global_epoch,test_split_name,use_gan,num_samples,loss_total,loss_recon,loss_g_gan,loss_d,eta1,beta_gan,lambda_recon,mel_l1_full,mel_l1_missing,psnr_full,psnr_missing,ssim
+/home/sanmu/Vision-Infused-Audio-Inpainter-VIAI/checkpoints/VIAI-A_checkpoint_step000000001.pth.tar,1,1,0,train_viai_a_split.txt,False,1,0.3569744825363159,0.3569744825363159,0.0,0.0,1.0,0.1,1.0,0.16347266733646393,0.1935018002986908,13.547611236572266,12.258368492126465,0.14177877353861143

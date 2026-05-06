@@ -27,6 +27,16 @@ class BaseOptions(object):
         # Resume / checkpoint
         self.parser.add_argument("--resume", action="store_true")
         self.parser.add_argument("--resume_path", type=str, default=None)
+        self.parser.add_argument(
+            "--init_from_viai_a",
+            type=str,
+            default=None,
+            help=(
+                "For VIAI-AV stage 3, initialize audio-side weights from a "
+                "VIAI-A or VIAI-A-PatchGAN checkpoint. If omitted, train-viai-av "
+                "looks for the latest VIAI-A-PatchGAN checkpoint in checkpoint_dir."
+            ),
+        )
         self.parser.add_argument("--load_pretrain", action="store_true")
         self.parser.add_argument("--wavenet_pretrain", type=str, default=None)
         self.parser.add_argument("--reset_optimizer", action="store_true")
@@ -137,7 +147,9 @@ class BaseOptions(object):
         self.parser.add_argument("--image_size", type=int, default=256)
         self.parser.add_argument("--image_rescal_size", type=int, default=256)
         self.parser.add_argument("--image_channel_size", type=int, default=3)
-        self.parser.add_argument("--image_hope_size", type=int, default=2)
+        self.parser.add_argument("--image_hope_size", type=int, default=1)
+        self.parser.add_argument("--visual_frame_count", type=int, default=50)
+        self.parser.add_argument("--visual_frame_interval_sec", type=float, default=0.08)
         self.parser.add_argument("--image", type=bool, default=True)
         self.parser.add_argument("--flow", type=bool, default=True)
         self.parser.add_argument("--load_num", type=int, default=1)

@@ -107,14 +107,14 @@ def _mel_to_uint8_image(mel_2d):
     return (rgb * 255.0).round().astype(np.uint8)
 
 
-def save_mel_comparison_png(path, mel_input, mel_pred, mel_target):
+def save_mel_comparison_png(path, mel_masked, mel_interpolated, mel_pred, mel_target):
     from PIL import Image, ImageDraw
 
     panels = [
-        ("masked input", _mel_to_uint8_image(mel_input)),
+        ("masked", _mel_to_uint8_image(mel_masked)),
+        ("interpolated", _mel_to_uint8_image(mel_interpolated)),
         ("prediction", _mel_to_uint8_image(mel_pred)),
-        ("target", _mel_to_uint8_image(mel_target)),
-        ("abs error", _mel_to_uint8_image(torch.abs(mel_pred - mel_target))),
+        ("groundtruth", _mel_to_uint8_image(mel_target)),
     ]
     label_height = 18
     gap = 4
@@ -135,7 +135,15 @@ def save_mel_comparison_png(path, mel_input, mel_pred, mel_target):
     canvas.save(path)
 
 
-def save_mel_comparison_batch(output_dir, start_index, paths, mel_input, mel_pred, mel_target):
+def save_mel_comparison_batch(
+    output_dir,
+    start_index,
+    paths,
+    mel_input,
+    mel_pred,
+    mel_target,
+    missing_mask=None,
+):
     import os
     import re
 
@@ -143,6 +151,11 @@ def save_mel_comparison_batch(output_dir, start_index, paths, mel_input, mel_pre
     mel_input = torch.clamp(_as_bchw(mel_input).detach().cpu(), 0.0, 1.0)
     mel_pred = torch.clamp(_as_bchw(mel_pred).detach().cpu(), 0.0, 1.0)
     mel_target = torch.clamp(_as_bchw(mel_target).detach().cpu(), 0.0, 1.0)
+    if missing_mask is None:
+        mel_masked = mel_input
+    else:
+        mask = _as_bchw(missing_mask).detach().cpu().to(dtype=mel_target.dtype)
+        mel_masked = torch.clamp(mel_target * (1.0 - mask), 0.0, 1.0)
 
     written_paths = []
     for index in range(mel_target.size(0)):
@@ -154,6 +167,7 @@ def save_mel_comparison_batch(output_dir, start_index, paths, mel_input, mel_pre
         output_path = os.path.join(output_dir, filename)
         save_mel_comparison_png(
             output_path,
+            mel_masked[index, 0],
             mel_input[index, 0],
             mel_pred[index, 0],
             mel_target[index, 0],
