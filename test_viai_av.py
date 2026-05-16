@@ -14,6 +14,7 @@ from Data_loaders import audio_loader as av_loader
 from Models.VIAI_AV_inpainting import VIAIAVModel
 from utils import util
 from utils.viai_a_metrics import compute_viai_a_metrics, save_mel_comparison_batch
+from utils.vocoder import save_vocoder_batch
 
 
 hparams = Options_inpainting.Inpainting_Config()
@@ -65,6 +66,11 @@ RESULT_FIELDS = [
     "retrieval_video_to_audio_r50",
     "retrieval_video_to_audio_medr",
     "retrieval_video_to_audio_meanr",
+    "use_vocoder",
+    "vocoder_backend",
+    "vocoder_n_iter",
+    "vocoder_output_dir",
+    "vocoder_num_samples",
 ]
 
 
@@ -137,7 +143,7 @@ def mel_image_output_dir(results_dir, checkpoint_step_value):
     )
 
 
-def evaluate(model, data_loader, image_dir=None):
+def evaluate(model, data_loader, image_dir=None, vocoder_dir=None):
     totals = {
         "loss_total": 0.0,
         "loss_av_gen": 0.0,
@@ -161,6 +167,8 @@ def evaluate(model, data_loader, image_dir=None):
     sample_count = 0
     batch_count = 0
     skipped_batches = 0
+    vocoder_count = 0
+    vocoder_max_samples = getattr(hparams, "vocoder_max_samples", None)
     audio_embeddings = []
     video_embeddings = []
 
@@ -213,6 +221,27 @@ def evaluate(model, data_loader, image_dir=None):
                 model.mel_pred,
                 model.mel_target_4d,
             )
+        if vocoder_dir is not None:
+            remaining = None
+            if vocoder_max_samples is not None:
+                remaining = int(vocoder_max_samples) - vocoder_count
+                if remaining <= 0:
+                    remaining = 0
+            if remaining is None or remaining > 0:
+                written = save_vocoder_batch(
+                    vocoder_dir,
+                    sample_count - batch_size,
+                    model.path_batch,
+                    model.mel_input_4d,
+                    model.mel_pred,
+                    model.missing_mask,
+                    model.audio_target,
+                    hparams,
+                    backend=getattr(hparams, "vocoder_backend", "griffin_lim"),
+                    n_iter=getattr(hparams, "vocoder_n_iter", 32),
+                    max_items=remaining,
+                )
+                vocoder_count += len(written)
         progress.set_postfix(
             loss=f"{model.loss_total_item:.4f}",
             recon=f"{model.loss_recon_item:.4f}",
@@ -253,6 +282,8 @@ def evaluate(model, data_loader, image_dir=None):
         "retrieval_audio_to_video": audio_to_video,
         "retrieval_video_to_audio": video_to_audio,
         "skipped_batches": skipped_batches,
+        "vocoder_output_dir": "" if vocoder_dir is None else vocoder_dir,
+        "vocoder_num_samples": vocoder_count,
     }
 
 
@@ -301,12 +332,24 @@ def build_result_record(checkpoint_path, checkpoint_step_value, global_step, glo
         "retrieval_video_to_audio_r50": float(video_to_audio[3]),
         "retrieval_video_to_audio_medr": float(video_to_audio[4]),
         "retrieval_video_to_audio_meanr": float(video_to_audio[5]),
+        "use_vocoder": bool(getattr(hparams, "use_vocoder", False)),
+        "vocoder_backend": getattr(hparams, "vocoder_backend", "griffin_lim"),
+        "vocoder_n_iter": int(getattr(hparams, "vocoder_n_iter", 32)),
+        "vocoder_output_dir": results.get("vocoder_output_dir", ""),
+        "vocoder_num_samples": int(results.get("vocoder_num_samples", 0)),
     }
 
 
 def coerce_csv_record(row):
     record = {}
-    int_fields = {"checkpoint_step", "global_step", "global_epoch", "num_samples"}
+    int_fields = {
+        "checkpoint_step",
+        "global_step",
+        "global_epoch",
+        "num_samples",
+        "vocoder_n_iter",
+        "vocoder_num_samples",
+    }
     float_fields = {
         "loss_total",
         "loss_av_gen",
@@ -401,7 +444,16 @@ def main():
     if checkpoint_step_value < 0:
         checkpoint_step_value = global_step
     image_dir = mel_image_output_dir(hparams.results_dir, checkpoint_step_value)
-    results = evaluate(model, data_loaders["test"], image_dir=image_dir)
+    vocoder_dir = None
+    if getattr(hparams, "use_vocoder", False):
+        vocoder_dir = hparams.vocoder_output_dir
+        if not vocoder_dir:
+            vocoder_dir = os.path.join(
+                hparams.results_dir,
+                "wav",
+                f"step{format_step(checkpoint_step_value)}",
+            )
+    results = evaluate(model, data_loaders["test"], image_dir=image_dir, vocoder_dir=vocoder_dir)
     result_record = build_result_record(
         checkpoint_path,
         checkpoint_step_value,
@@ -456,6 +508,11 @@ def main():
     print(f"[VIAI-AV test] wrote json: {json_path}")
     print(f"[VIAI-AV test] wrote summary csv: {csv_path}")
     print(f"[VIAI-AV test] wrote mel images: {image_dir}")
+    if getattr(hparams, "use_vocoder", False):
+        print(
+            f"[VIAI-AV test] wrote vocoder wavs: {results['vocoder_output_dir']} "
+            f"({results['vocoder_num_samples']} samples)"
+        )
 
 
 if __name__ == "__main__":

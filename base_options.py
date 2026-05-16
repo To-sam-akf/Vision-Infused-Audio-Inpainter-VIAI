@@ -168,6 +168,38 @@ class BaseOptions(object):
         self.parser.add_argument("--ref_level_db", type=float, default=20.0)
         self.parser.add_argument("--allow_clipping_in_normalization", type=bool, default=True)
 
+        # Optional Mel-to-waveform output for test/demo runs.
+        self.parser.add_argument(
+            "--use_vocoder",
+            action="store_true",
+            help="During test, synthesize wav files from reconstructed Mel spectrograms.",
+        )
+        self.parser.add_argument(
+            "--vocoder_backend",
+            type=str,
+            default="griffin_lim",
+            choices=["griffin_lim"],
+            help="Mel-to-waveform backend. Current route B implementation uses Griffin-Lim.",
+        )
+        self.parser.add_argument(
+            "--vocoder_n_iter",
+            type=int,
+            default=32,
+            help="Number of Griffin-Lim iterations when --use_vocoder is enabled.",
+        )
+        self.parser.add_argument(
+            "--vocoder_max_samples",
+            type=int,
+            default=None,
+            help="Optional cap on the number of wav samples generated during one test run.",
+        )
+        self.parser.add_argument(
+            "--vocoder_output_dir",
+            type=str,
+            default=None,
+            help="Optional wav output directory. Defaults to <results_dir>/wav/stepXXXXXXXXX.",
+        )
+
         # Visual stream and fusion encoder
         self.parser.add_argument("--feature_length", type=int, default=256)
         self.parser.add_argument("--length_feature", type=int, default=256)

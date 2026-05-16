@@ -1229,3 +1229,64 @@ sync loss 梯度约束检查已通过：
 mel_encoder_sync_grad_sum=0.000000
 video_encoder_sync_grad_sum=9112.837492
 ```
+
+## 2026-05-16 VIAI 第五阶段 Griffin-Lim vocoder 输出
+
+根据 `information.md` 8.5 的路线 B，本次先接入轻量 Griffin-Lim vocoder，用于从测试阶段的修复 Mel-spectrogram 导出 waveform。该路线不训练 WaveNet，也不依赖 HiFi-GAN / WaveGlow 预训练 checkpoint；目标是先跑通端到端 demo 音频输出。
+
+### 主要改动
+1. `utils/vocoder.py`
+   - 新增 normalized Mel `[0, 1]` 到 waveform 的反变换工具。
+   - 复用当前工程 Mel 参数：16kHz、80 Mel bins、`fft_size=1280`、`hop_size=320`、`fmin=125`、`fmax=7600`、`min_level_db=-100`、`ref_level_db=20`。
+   - 使用 `librosa.feature.inverse.mel_to_audio(..., power=1.0, center=False)`，并把输出裁剪/补零到 `mel_frames * hop_size`。
+   - 批量保存 `*_reconstructed.wav` 和 `*_target.wav`。
+
+2. `base_options.py`
+   - 新增 `--use_vocoder`，默认关闭。
+   - 新增 `--vocoder_backend griffin_lim`、`--vocoder_n_iter`、`--vocoder_max_samples`、`--vocoder_output_dir`。
+
+3. `test_viai_a.py` / `test_viai_av.py`
+   - 测试指标、Mel 图默认行为保持不变。
+   - 开启 `--use_vocoder` 后，输出目录默认为 `<results_dir>/wav/stepXXXXXXXXX/`。
+   - reconstructed Mel 使用 `mel_input * (1 - missing_mask) + mel_pred * missing_mask`，只替换缺失区域。
+   - JSON/CSV 增加 `use_vocoder`、`vocoder_backend`、`vocoder_n_iter`、`vocoder_output_dir`、`vocoder_num_samples`。
+
+4. `README.md`
+   - 新增“第五阶段：Griffin-Lim vocoder 输出 waveform”说明和命令示例。
+
+### 验证命令
+静态检查已通过：
+```bash
+.venv/bin/python -m py_compile base_options.py utils/vocoder.py test_viai_a.py test_viai_av.py
+```
+
+Griffin-Lim 单条 Mel 反变换 smoke test 已通过：
+```bash
+.venv/bin/python -c "import numpy as np; from Options_inpainting import Inpainting_Config; from utils.vocoder import mel_to_waveform; hp=Inpainting_Config(force_reload=True, args=[]); mel=np.load('data/processed/accordion/A2p8VW61RGc/mel.npy').astype('float32')[:200].T; wav=mel_to_waveform(mel, hp, n_iter=1); print(wav.shape, wav.dtype, bool(np.isfinite(wav).all()), float(wav.min()), float(wav.max()))"
+```
+
+关键输出：
+```text
+(64000,) float32 True -0.48688557744026184 10.033004760742188
+```
+
+VIAI-A vocoder smoke test 已通过：
+```bash
+.venv/bin/python main.py test-viai-a -- --data_root data --resume_path checkpoints/VIAI-A_checkpoint_step000000001.pth.tar --test_split_name train_viai_a_split.txt --batch_size 1 --num_workers 0 --display_id 0 --results_dir /tmp/viai_vocoder_a_results --use_vocoder --vocoder_max_samples 1 --vocoder_n_iter 1
+```
+
+关键输出：
+```text
+[VIAI-A test] wrote vocoder wavs: /tmp/viai_vocoder_a_results/wav/step000000001 (1 samples)
+```
+
+VIAI-AV vocoder smoke test 已通过。由于仓库内旧 `checkpoints/VIAI-AV_checkpoint_step000000001.pth.tar` 缺少当前 `VideoEncoder` 字段，本次先用当前代码训练 1 step 到 `/tmp`，再验证测试入口：
+```bash
+.venv/bin/python main.py train-viai-av -- --data_root data --init_from_viai_a checkpoints/VIAI-A_checkpoint_step000000001.pth.tar --checkpoint_dir /tmp/viai_vocoder_av_smoke --log_event_path /tmp/viai_vocoder_av_smoke/events --batch_size 1 --num_workers 0 --max_train_steps 1 --display_id 0 --print_freq 1
+.venv/bin/python main.py test-viai-av -- --data_root data --resume_path /tmp/viai_vocoder_av_smoke/VIAI-AV_checkpoint_step000000001.pth.tar --test_split_name train_new_split.txt --batch_size 1 --num_workers 0 --display_id 0 --results_dir /tmp/viai_vocoder_av_results --use_vocoder --vocoder_max_samples 1 --vocoder_n_iter 1
+```
+
+关键输出：
+```text
+[VIAI-AV test] wrote vocoder wavs: /tmp/viai_vocoder_av_results/wav/step000000001 (1 samples)
+```
