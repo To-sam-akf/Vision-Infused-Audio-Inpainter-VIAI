@@ -1120,3 +1120,112 @@ VIAI-A 第一/第二阶段入口回归已通过：
 [VIAI-A train] step=1 loss=0.569536 full_l1=0.269511 missing_l1=0.300025 eta1=1.000000 psnr=9.682 psnr_missing=9.013 ssim=0.018781
 [VIAI-A test] samples=1 loss=0.337543 recon=0.337543 g_gan=0.000000 d=0.000000 eta1=1.000000 mel_l1_full=0.163488 mel_l1_missing=0.174055 psnr_full=13.548 psnr_missing=12.967 ssim=0.1415
 ```
+
+## 2026-05-08 VIAI-AV 坏 clip 跳过与记录
+
+### 修改内容
+1. 新增 `utils/av_sample_validation.py`，统一计算 AV 训练窗口需求，并写入 `viai_av_bad_samples.csv`。
+2. `tools/prepare_musices.py`：当实际抽取视觉帧数少于 `--visual-frame-count` 时跳过该 clip；`--skip-existing` 遇到已存在但不合格的样本会重新处理。
+3. `tools/split_musices.py`：AV split 生成前过滤短帧/短音频/短 Mel 样本，并把排除原因追加到 `$DATA_ROOT/viai_av_bad_samples.csv`。
+4. `Data_loaders/audio_loader.py` / `train_viai_av.py`：训练时发现旧 split 残留坏样本会记录并跳过；`--strict_av_samples` 可恢复 fail-fast。
+5. `base_options.py`：新增 `--bad_sample_log` 和 `--strict_av_samples`。
+
+### 验证命令
+```bash
+.venv/bin/python -m py_compile Data_loaders/audio_loader.py tools/split_musices.py tools/prepare_musices.py train_viai_av.py base_options.py utils/av_sample_validation.py
+.venv/bin/python main.py split-data -- --data-root /tmp/viai_bad_data_liu8w1ar --test-size 0 --val-size 0 --allow-empty-eval
+.venv/bin/python main.py train-viai-av -- --data_root /tmp/viai_bad_data_liu8w1ar --train_split_name train_mixed_split.txt --init_from_viai_a checkpoints/VIAI-A_checkpoint_step000000001.pth.tar --checkpoint_dir /tmp/viai_bad_train_smoke --log_event_path /tmp/viai_bad_train_smoke/events --batch_size 2 --num_workers 0 --max_train_steps 1 --print_freq 1 --display_id 0
+```
+
+## 2026-05-13 VIAI-AV 第四阶段 sync/probe 复现
+
+### 修改内容
+1. `Models/VIAI_AV_inpainting.py`
+   - 在现有 `VIAIAVModel` 中默认启用第四阶段。
+   - 新增 batch 内 `L2ContrastiveLoss` sync loss：`fa_t = Ea(s_t)` 与 `fv = Ev(video, flow)` 先 L2 normalize，同 index 为正样本，batch 内不同 index 为负样本，`sync_margin=1.0`。
+   - sync loss 对 `fa_t` 使用 `detach()`，保证该项只更新 `VideoEncoder`。
+   - 新增 VIAI-AA' probe branch：`s_aa' = Gav(Ea(s_i), Ea(s_t))`，复用同一个 `MelDecoderImage`、`MelDiscriminator`，不新增网络参数。
+   - 总损失改为：
+     ```text
+     L_total = L_av_gen + lambda_sync * L_sync + lambda_probe * eta2(t) * L_probe_gen
+     L_av_gen = L_av_gan + beta_gan * L_av_recon
+     L_probe_gen = L_probe_gan + beta_gan * L_probe_recon
+     ```
+   - 判别器 fake loss 在 probe 开启时对主 AV fake 和 AA' fake 取平均。
+   - checkpoint `stage` 改为 `VIAI-AV-stage4-sync-probe`，并写入 `enable_sync_loss` / `enable_probe_loss`。
+
+2. `base_options.py`
+   - 新增 `--disable_sync_loss`、`--disable_probe_loss` 用于 ablation 或退回第三阶段式损失。
+   - 新增 `--lambda_probe`，默认 `1.0`。
+   - 新增 `--probe_decay_base`、`--probe_decay_interval`、`--probe_decay_floor`；未显式传入时沿用 `sync_decay_*` 作为兼容默认值。
+
+3. `train_viai_av.py`
+   - tqdm、stdout、TensorBoard 增加 `sync`、`probe`、`eta2`、`probe_full_l1`、`probe_missing_l1`、`probe_g_gan` 等监控项。
+   - `--disable_sync_loss --disable_probe_loss` 下 `sync=0`、`probe=0`，总损失退回主 AV generator loss。
+
+4. `test_viai_av.py`
+   - JSON/CSV 增加 sync/probe loss、`eta2`、probe L1、audio->video / video->audio retrieval 指标。
+   - 测试仍只保存主 AV 输出的 Mel 对比图，AA' probe 只作为 loss/metric 输出。
+
+5. `README.md`
+   - 新增“第四阶段：加入 sync loss 和 probe loss”说明，记录默认启用、ablation 参数、推荐命令和输出字段。
+
+### 验证命令
+静态检查已通过：
+```bash
+python3 -m py_compile base_options.py train_viai_av.py test_viai_av.py Models/VIAI_AV_inpainting.py loss_functions.py utils/util.py
+```
+
+第四阶段训练 smoke test 已通过：
+```bash
+.venv/bin/python main.py train-viai-av -- --data_root data --init_from_viai_a checkpoints/VIAI-A_checkpoint_step000000001.pth.tar --checkpoint_dir /tmp/viai_av_stage4_smoke --log_event_path /tmp/viai_av_stage4_smoke/events --batch_size 1 --num_workers 0 --max_train_steps 1 --display_id 0 --print_freq 1
+```
+
+关键输出：
+```text
+[VIAI-AV train] step=1 loss=2.451999 av_gen=0.916690 recon=0.574608 full_l1=0.292652 missing_l1=0.281956 sync=0.618531 probe=0.916778 probe_full_l1=0.290695 probe_missing_l1=0.244090 g_gan=0.859229 probe_g_gan=0.863299 d=0.718636 eta1=1.000000 eta2=1.000000 psnr=9.198 psnr_missing=9.529 ssim=0.011838
+Saved VIAI-AV checkpoint: /tmp/viai_av_stage4_smoke/VIAI-AV_checkpoint_step000000001.pth.tar
+```
+
+第三阶段兼容 smoke test 已通过：
+```bash
+.venv/bin/python main.py train-viai-av -- --data_root data --init_from_viai_a checkpoints/VIAI-A_checkpoint_step000000001.pth.tar --checkpoint_dir /tmp/viai_av_stage4_stage3_compat --log_event_path /tmp/viai_av_stage4_stage3_compat/events --batch_size 1 --num_workers 0 --max_train_steps 1 --display_id 0 --print_freq 1 --disable_sync_loss --disable_probe_loss
+```
+
+关键输出：
+```text
+[VIAI-AV train] step=1 loss=0.889254 av_gen=0.889254 recon=0.671244 full_l1=0.319207 missing_l1=0.352037 sync=0.000000 probe=0.000000 probe_full_l1=0.000000 probe_missing_l1=0.000000 g_gan=0.822129 probe_g_gan=0.000000 d=0.718065 eta1=1.000000 eta2=1.000000
+```
+
+第四阶段测试入口已通过。由于本地 `test_new_split.txt` 为空，本次临时使用 `train_new_split.txt` 验证测试路径：
+```bash
+.venv/bin/python main.py test-viai-av -- --data_root data --resume_path /tmp/viai_av_stage4_smoke/VIAI-AV_checkpoint_step000000001.pth.tar --test_split_name train_new_split.txt --batch_size 1 --num_workers 0 --display_id 0 --results_dir /tmp/viai_av_stage4_smoke_results
+```
+
+关键输出：
+```text
+[VIAI-AV test] samples=1 loss=2.314855 av_gen=0.760267 recon=0.297125 sync=0.794257 probe=0.760332 g_gan=0.730555 probe_g_gan=0.730565 d=0.690305 eta1=1.000000 eta2=1.000000 mel_l1_full=0.154027 mel_l1_missing=0.143098 probe_l1_full=0.154349 probe_l1_missing=0.143321 psnr_full=14.853 psnr_missing=15.439 ssim=0.1227
+[VIAI-AV test] audio->video retrieval R@1=100.00 R@5=100.00 R@10=100.00 R@50=100.00 MedR=1.0 MeanR=1.0
+[VIAI-AV test] video->audio retrieval R@1=100.00 R@5=100.00 R@10=100.00 R@50=100.00 MedR=1.0 MeanR=1.0
+```
+
+checkpoint / JSON 字段检查已通过：
+```text
+checkpoint stage: VIAI-AV-stage4-sync-probe
+checkpoint flags: True True
+checkpoint has: Mel_Encoder, VideoEncoder, Mel_Decoder, netD, optimizer_G, optimizer_D
+stage: VIAI-AV-stage4-sync-probe
+enable_sync_loss: True
+enable_probe_loss: True
+loss_sync: 0.7942565083503723
+loss_probe_gen: 0.7603315711021423
+eta2: 1.0
+retrieval_audio_to_video_r1: 100.0
+retrieval_video_to_audio_r1: 100.0
+```
+
+sync loss 梯度约束检查已通过：
+```text
+mel_encoder_sync_grad_sum=0.000000
+video_encoder_sync_grad_sum=9112.837492
+```

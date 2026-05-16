@@ -44,6 +44,19 @@ class BaseOptions(object):
         self.parser.add_argument("--checkpoints_dir", type=str, default="./checkpoints")
         self.parser.add_argument("--log_event_path", type=str, default=None)
         self.parser.add_argument(
+            "--bad_sample_log",
+            "--bad-sample-log",
+            dest="bad_sample_log",
+            type=str,
+            default=None,
+        )
+        self.parser.add_argument(
+            "--strict_av_samples",
+            "--strict-av-samples",
+            dest="strict_av_samples",
+            action="store_true",
+        )
+        self.parser.add_argument(
             "--results_dir",
             type=str,
             default="./checkpoints/viai_a_test_results",
@@ -108,13 +121,27 @@ class BaseOptions(object):
         self.parser.add_argument("--lambda_recon", type=float, default=1.0)
         self.parser.add_argument("--beta_gan", type=float, default=0.1)
         self.parser.add_argument("--lambda_sync", type=float, default=1.0)
+        self.parser.add_argument("--lambda_probe", type=float, default=1.0)
         self.parser.add_argument("--sync_margin", type=float, default=1.0)
+        self.parser.add_argument(
+            "--disable_sync_loss",
+            action="store_true",
+            help="For VIAI-AV stage 4 ablation, disable contrastive audio-video sync loss.",
+        )
+        self.parser.add_argument(
+            "--disable_probe_loss",
+            action="store_true",
+            help="For VIAI-AV stage 4 ablation, disable the VIAI-AA' probe branch loss.",
+        )
         self.parser.add_argument("--recon_decay_base", type=float, default=0.9)
         self.parser.add_argument("--recon_decay_interval", type=float, default=1000.0)
         self.parser.add_argument("--recon_decay_floor", type=float, default=0.1)
         self.parser.add_argument("--sync_decay_base", type=float, default=0.9)
         self.parser.add_argument("--sync_decay_interval", type=float, default=1000.0)
         self.parser.add_argument("--sync_decay_floor", type=float, default=0.1)
+        self.parser.add_argument("--probe_decay_base", type=float, default=None)
+        self.parser.add_argument("--probe_decay_interval", type=float, default=None)
+        self.parser.add_argument("--probe_decay_floor", type=float, default=None)
 
         # Missing-region setup (4s inputs, 0.4s~1.0s gaps)
         self.parser.add_argument("--max_time_sec", type=float, default=None)
@@ -202,6 +229,13 @@ class BaseOptions(object):
             opt.max_mel_lengths = opt.max_time_steps // opt.hop_size
         opt.num_mels = opt.cin_channels
 
+        if opt.probe_decay_base is None:
+            opt.probe_decay_base = opt.sync_decay_base
+        if opt.probe_decay_interval is None:
+            opt.probe_decay_interval = opt.sync_decay_interval
+        if opt.probe_decay_floor is None:
+            opt.probe_decay_floor = opt.sync_decay_floor
+
         if opt.norm_type.lower() == "instance":
             opt.normlayer = nn.InstanceNorm2d
         else:
@@ -211,5 +245,7 @@ class BaseOptions(object):
             opt.checkpoint_dir = os.path.join(opt.checkpoints_dir, opt.name)
         if not opt.log_event_path:
             opt.log_event_path = os.path.join(opt.checkpoint_dir, "events")
+        if not opt.bad_sample_log:
+            opt.bad_sample_log = os.path.join(opt.data_root, "viai_av_bad_samples.csv")
 
         return opt

@@ -13,6 +13,13 @@ import cv2
 from wavenet_vocoder.util import is_mulaw_quantize, is_mulaw, is_raw, is_scalar_input
 import numpy as np
 import Options_inpainting
+from utils.av_sample_validation import (
+    BadAVSampleError,
+    av_window_requirements,
+    inspect_av_sample,
+    log_bad_sample,
+    validate_av_sample,
+)
 
 hparams = Options_inpainting.Inpainting_Config()
 
@@ -52,6 +59,48 @@ def ensure_divisible(length, divisible_by=256, lower=True):
 
 def assert_ready_for_upsampling(x, c):
     assert len(x) % len(c) == 0 and len(x) // len(c) == get_hop_size()
+
+
+def _bad_sample_log_path():
+    return getattr(hparams, "bad_sample_log", None)
+
+
+def _handle_bad_av_sample(error, source, phase=None, split_name=None, sample_path=None):
+    if getattr(hparams, "strict_av_samples", False):
+        raise error
+    sample_path = sample_path or getattr(error, "sample_path", "")
+    log_path = log_bad_sample(
+        hparams.data_root,
+        _bad_sample_log_path(),
+        source=source,
+        phase=phase,
+        split_name=split_name,
+        sample_path=sample_path,
+        error=error,
+    )
+    print(
+        f"[VIAI-AV data] skipped bad sample: {sample_path} "
+        f"reason={getattr(error, 'reason', error.__class__.__name__)} log={log_path}"
+    )
+    return None
+
+
+def _alignment_error(reason, path, message, found_mel_frames=None, found_audio_steps=None):
+    requirements = av_window_requirements(hparams)
+    record = {
+        "sample_path": str(path),
+        "reason": reason,
+        "required_video_frames": requirements["required_video_frames"],
+        "found_image_frames": "",
+        "found_flow_x_frames": "",
+        "found_flow_y_frames": "",
+        "required_mel_frames": requirements["required_mel_frames"],
+        "found_mel_frames": found_mel_frames,
+        "required_audio_steps": requirements["required_audio_steps"],
+        "found_audio_steps": found_audio_steps,
+        "error_message": message,
+    }
+    return BadAVSampleError(reason, path, record=record, error_message=message)
 
 
 class _NPYDataSource(FileDataSource):
@@ -171,13 +220,16 @@ class ImageDataSource(FileDataSource):
 
 
 def sample_data_new(data_path, train=True, hparams=hparams):
+    validation_record = validate_av_sample(data_path, hparams)
     flow_x_crop_path = os.path.join(data_path, 'flow_x_crop')
     flow_y_crop_path = os.path.join(data_path, 'flow_y_crop')
     image_crop_path = os.path.join(data_path, 'image_crop')
-    find_all_flows = glob.glob(os.path.join(flow_x_crop_path, '*.jpg'))
-    len_flows = len(find_all_flows)
     max_time_steps = hparams.max_time_steps
-    num_images = len_flows
+    num_images = min(
+        int(validation_record["found_image_frames"]),
+        int(validation_record["found_flow_x_frames"]),
+        int(validation_record["found_flow_y_frames"]),
+    )
     max_time_second = max_time_steps / hparams.sample_rate
 
     frame_stride = max(1, int(hparams.image_hope_size))
@@ -192,10 +244,9 @@ def sample_data_new(data_path, train=True, hparams=hparams):
     )
     mel_frames_per_visual_frame = visual_frame_interval_sec * hparams.sample_rate / hparams.hop_size
     mel_window_frames = int(round(use_image_num * mel_frames_per_visual_frame))
-    mel_path = os.path.join(data_path, "mel.npy")
     max_start_by_mel = None
-    if os.path.exists(mel_path):
-        mel_frames = int(np.load(mel_path, mmap_mode="r").shape[0])
+    if validation_record["found_mel_frames"] is not None:
+        mel_frames = int(validation_record["found_mel_frames"])
         max_start_by_mel = int(
             np.floor((mel_frames - mel_window_frames) / mel_frames_per_visual_frame)
         )
@@ -209,10 +260,15 @@ def sample_data_new(data_path, train=True, hparams=hparams):
         if max_start_by_mel is not None:
             max_start = min(max_start, max_start_by_mel)
     if max_start < min_start:
-        raise ValueError(
-            f"Not enough aligned audio/video frames in {data_path}: "
-            f"need video_frames={last_offset + 1}, mel_frames={mel_window_frames}; "
-            f"found video_frames={num_images}"
+        raise BadAVSampleError(
+            "no_aligned_av_window",
+            data_path,
+            record=validation_record,
+            error_message=(
+                f"Not enough aligned audio/video frames in {data_path}: "
+                f"need video_frames={last_offset + 1}, mel_frames={mel_window_frames}; "
+                f"found video_frames={num_images}"
+            ),
         )
     start_candidates = np.arange(min_start, max_start + 1)
     image_start = int(np.random.choice(start_candidates))
@@ -250,6 +306,13 @@ def sample_data_new(data_path, train=True, hparams=hparams):
                 image_path = os.path.join(image_crop_path, str(item + 1) + '.jpg')
                 if hparams.image:
                     image = cv2.imread(image_path)
+                    if image is None:
+                        raise BadAVSampleError(
+                            "unreadable_image_frame",
+                            data_path,
+                            record=validation_record,
+                            error_message=f"Unable to read image frame: {image_path}",
+                        )
                     image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
                     if train:
                         image = cv2.resize(image, (image_rescal_size, image_rescal_size))
@@ -262,6 +325,16 @@ def sample_data_new(data_path, train=True, hparams=hparams):
                 if hparams.flow:
                     flow_x = cv2.imread(flow_x_path, 0)
                     flow_y = cv2.imread(flow_y_path, 0)
+                    if flow_x is None or flow_y is None:
+                        raise BadAVSampleError(
+                            "unreadable_flow_frame",
+                            data_path,
+                            record=validation_record,
+                            error_message=(
+                                f"Unable to read flow frame: flow_x={flow_x_path}, "
+                                f"flow_y={flow_y_path}"
+                            ),
+                        )
                     if train:
                         flow_x = cv2.resize(flow_x, (image_rescal_size, image_rescal_size))
                         flow_y = cv2.resize(flow_y, (image_rescal_size, image_rescal_size))
@@ -448,24 +521,35 @@ class PyTorchImageDataset(object):
         self.X = X
         self.Mel = Mel
         self.Image = Image
+        self.phase = getattr(Image.file_data_source, "phase", "")
+        self.split_name = getattr(Image.file_data_source, "split_name", "")
         # alias
         self.multi_speaker = X.file_data_source.multi_speaker
 
     def __getitem__(self, idx):
-        if self.Mel is None:
-            mel = None
-        else:
-            mel = self.Mel[idx]
+        try:
+            if self.Mel is None:
+                mel = None
+            else:
+                mel = self.Mel[idx]
 
-        raw_audio = self.X[idx]
-        video_block, flow_block, start, path = self.Image[idx]
-        if self.multi_speaker:
-            speaker_id = self.X.file_data_source.speaker_ids[idx]
-        else:
-            speaker_id = None
+            raw_audio = self.X[idx]
+            video_block, flow_block, start, path = self.Image[idx]
+            if self.multi_speaker:
+                speaker_id = self.X.file_data_source.speaker_ids[idx]
+            else:
+                speaker_id = None
+        except BadAVSampleError as exc:
+            return _handle_bad_av_sample(
+                exc,
+                source="dataloader",
+                phase=self.phase,
+                split_name=self.split_name,
+                sample_path=getattr(exc, "sample_path", ""),
+            )
 
         # (x,c,g)
-        return raw_audio, mel, video_block, flow_block, start, speaker_id, path
+        return raw_audio, mel, video_block, flow_block, start, speaker_id, path, self.phase, self.split_name
 
     def __len__(self):
         return len(self.X)
@@ -484,6 +568,10 @@ def collate_fn(batch):
             - x (FloatTensor) : Network inputs (B, C, T)
             - y (LongTensor)  : Network targets (B, T, 1)
     """
+
+    batch = [item for item in batch if item is not None]
+    if not batch:
+        return None
 
     local_conditioning = len(batch[0]) >= 2 and hparams.cin_channels > 0
     global_conditioning = len(batch[0]) >= 3 and hparams.file_channel > 0
@@ -511,36 +599,67 @@ def collate_fn(batch):
     if local_conditioning:
         new_batch = []
         for idx in range(len(batch)):
-            x, c, video, flow, start, g, path = batch[idx]
-            if hparams.upsample_conditional_features:
-                assert_ready_for_upsampling(x, c)
-                if max_time_steps is not None:
-                    max_steps = ensure_divisible(max_time_steps, get_hop_size(), True)
-                    if len(x) < max_steps:
-                        raise ValueError(
-                            f"Sample is shorter than the configured audio window: {path}, "
-                            f"audio_steps={len(x)}, required={max_steps}"
+            x, c, video, flow, start, g, path, phase, split_name = batch[idx]
+            try:
+                if hparams.upsample_conditional_features:
+                    if len(c) == 0 or len(x) % len(c) != 0 or len(x) // len(c) != get_hop_size():
+                        raise _alignment_error(
+                            "upsampling_mismatch",
+                            path,
+                            (
+                                f"Sample is not ready for upsampling: {path}, "
+                                f"audio_steps={len(x)}, mel_frames={len(c)}, hop_size={get_hop_size()}"
+                            ),
+                            found_mel_frames=len(c),
+                            found_audio_steps=len(x),
                         )
-
-                    for ln in range(hparams.load_num):
-                        mel_start = int(round(start[ln] * mel_frames_per_visual_frame))
-                        mel_end = mel_start + mel_window_frames
-                        audio_start = mel_start * hparams.hop_size
-                        audio_end = audio_start + audio_window_steps
-                        if mel_end > len(c) or audio_end > len(x):
-                            raise ValueError(
-                                f"Video/audio alignment exceeds sample length: {path}, "
-                                f"mel={mel_start}:{mel_end}/{len(c)}, "
-                                f"audio={audio_start}:{audio_end}/{len(x)}"
+                    if max_time_steps is not None:
+                        max_steps = ensure_divisible(max_time_steps, get_hop_size(), True)
+                        if len(x) < max_steps:
+                            raise _alignment_error(
+                                "insufficient_audio_steps",
+                                path,
+                                (
+                                    f"Sample is shorter than the configured audio window: {path}, "
+                                    f"audio_steps={len(x)}, required={max_steps}"
+                                ),
+                                found_mel_frames=len(c),
+                                found_audio_steps=len(x),
                             )
-                        c1 = c[mel_start:mel_end]
-                        x1 = x[audio_start:audio_end]
-                        new_batch.append((x1, c1, g, os.path.join(path, str(start[ln]))))
-                    video_block.append(torch.FloatTensor(video))
-                    flow_block.append(torch.FloatTensor(flow))
+
+                        for ln in range(hparams.load_num):
+                            mel_start = int(round(start[ln] * mel_frames_per_visual_frame))
+                            mel_end = mel_start + mel_window_frames
+                            audio_start = mel_start * hparams.hop_size
+                            audio_end = audio_start + audio_window_steps
+                            if mel_end > len(c) or audio_end > len(x):
+                                raise _alignment_error(
+                                    "alignment_exceeds_sample_length",
+                                    path,
+                                    (
+                                        f"Video/audio alignment exceeds sample length: {path}, "
+                                        f"mel={mel_start}:{mel_end}/{len(c)}, "
+                                        f"audio={audio_start}:{audio_end}/{len(x)}"
+                                    ),
+                                    found_mel_frames=len(c),
+                                    found_audio_steps=len(x),
+                                )
+                            c1 = c[mel_start:mel_end]
+                            x1 = x[audio_start:audio_end]
+                            new_batch.append((x1, c1, g, os.path.join(path, str(start[ln]))))
+                        video_block.append(torch.FloatTensor(video))
+                        flow_block.append(torch.FloatTensor(flow))
+            except BadAVSampleError as exc:
+                _handle_bad_av_sample(
+                    exc,
+                    source="collate",
+                    phase=phase,
+                    split_name=split_name,
+                    sample_path=path,
+                )
         batch = new_batch
     if not batch:
-        raise ValueError("No valid samples remained after audio/video window alignment")
+        return None
 
     # Lengths
     input_lengths = [len(x[0]) for x in batch]

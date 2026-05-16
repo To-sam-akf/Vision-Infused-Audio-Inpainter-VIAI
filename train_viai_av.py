@@ -57,20 +57,30 @@ def resolve_init_checkpoint():
         if not os.path.exists(candidate):
             raise RuntimeError(
                 f"VIAI-A initialization checkpoint not found: {candidate}. "
-                "Train/test stage 2 first, or pass an existing checkpoint."
+                "Train VIAI-A first, or pass an existing checkpoint."
             )
         return candidate
-    candidate = resolve_latest_checkpoint(
-        os.path.abspath(hparams.checkpoint_dir),
-        "VIAI-A-PatchGAN_checkpoint_step",
-    )
-    if candidate is None:
-        raise RuntimeError(
-            "train-viai-av requires a Stage2 VIAI-A-PatchGAN checkpoint. "
-            "Pass --init_from_viai_a explicitly, or place "
-            "VIAI-A-PatchGAN_checkpoint_step*.pth.tar under --checkpoint_dir."
+
+    checkpoint_dir = os.path.abspath(hparams.checkpoint_dir)
+    candidate = resolve_latest_checkpoint(checkpoint_dir, "VIAI-A-PatchGAN_checkpoint_step")
+    if candidate is not None:
+        print(f"[VIAI-AV] using VIAI-A PatchGAN checkpoint for initialization: {candidate}")
+        return candidate
+
+    candidate = resolve_latest_checkpoint(checkpoint_dir, "VIAI-A_checkpoint_step")
+    if candidate is not None:
+        print(
+            "[VIAI-AV] no VIAI-A-PatchGAN checkpoint found; "
+            f"falling back to VIAI-A audio-only checkpoint: {candidate}"
         )
-    return candidate
+        return candidate
+
+    raise RuntimeError(
+        "train-viai-av requires a VIAI-A initialization checkpoint. "
+        "Pass --init_from_viai_a explicitly, or place "
+        "VIAI-A-PatchGAN_checkpoint_step*.pth.tar or "
+        "VIAI-A_checkpoint_step*.pth.tar under --checkpoint_dir."
+    )
 
 
 def resolve_resume_checkpoint():
@@ -124,10 +134,17 @@ def run_phase(model, data_loader, phase, global_step, writer, global_epoch):
     train = phase == "train"
     totals = {
         "loss_total": 0.0,
+        "loss_av_gen": 0.0,
         "loss_recon": 0.0,
         "loss_full_l1": 0.0,
         "loss_missing_l1": 0.0,
         "loss_g_gan": 0.0,
+        "loss_sync": 0.0,
+        "loss_probe_gen": 0.0,
+        "loss_probe_recon": 0.0,
+        "loss_probe_full_l1": 0.0,
+        "loss_probe_missing_l1": 0.0,
+        "loss_probe_g_gan": 0.0,
         "loss_d": 0.0,
         "psnr_full": 0.0,
         "psnr_missing": 0.0,
@@ -136,6 +153,7 @@ def run_phase(model, data_loader, phase, global_step, writer, global_epoch):
     sample_count = 0
     ssim_sample_count = 0
     batch_count = 0
+    skipped_batches = 0
     stop_training = False
 
     progress = tqdm(
@@ -145,6 +163,10 @@ def run_phase(model, data_loader, phase, global_step, writer, global_epoch):
         dynamic_ncols=True,
     )
     for data in progress:
+        if data is None:
+            skipped_batches += 1
+            progress.set_postfix(skipped_batches=skipped_batches)
+            continue
         iter_start_time = time.time()
         model.get_blank_space_length(global_step)
         model.set_inputs(data)
@@ -162,10 +184,17 @@ def run_phase(model, data_loader, phase, global_step, writer, global_epoch):
         )
 
         totals["loss_total"] += model.loss_total_item
+        totals["loss_av_gen"] += model.loss_av_gen_item
         totals["loss_recon"] += model.loss_recon_item
         totals["loss_full_l1"] += model.loss_full_l1_item
         totals["loss_missing_l1"] += model.loss_missing_l1_item
         totals["loss_g_gan"] += model.loss_G_GAN_item
+        totals["loss_sync"] += model.loss_sync_item
+        totals["loss_probe_gen"] += model.loss_probe_gen_item
+        totals["loss_probe_recon"] += model.loss_probe_recon_item
+        totals["loss_probe_full_l1"] += model.loss_probe_full_l1_item
+        totals["loss_probe_missing_l1"] += model.loss_probe_missing_l1_item
+        totals["loss_probe_g_gan"] += model.loss_probe_G_GAN_item
         totals["loss_d"] += model.loss_D_item
         totals["psnr_full"] += metrics["psnr_full_sum"]
         totals["psnr_missing"] += metrics["psnr_missing_sum"]
@@ -178,8 +207,11 @@ def run_phase(model, data_loader, phase, global_step, writer, global_epoch):
             step=global_step,
             loss=f"{model.loss_total_item:.4f}",
             recon=f"{model.loss_recon_item:.4f}",
+            sync=f"{model.loss_sync_item:.4f}",
+            probe=f"{model.loss_probe_gen_item:.4f}",
             g_gan=f"{model.loss_G_GAN_item:.4f}",
             d=f"{model.loss_D_item:.4f}",
+            eta2=f"{model.eta2_item:.4f}",
             psnr=f"{metrics['psnr_full']:.2f}",
             psnr_miss=f"{metrics['psnr_missing']:.2f}",
             blank=model.blank_length,
@@ -198,12 +230,19 @@ def run_phase(model, data_loader, phase, global_step, writer, global_epoch):
             tqdm.write(
                 f"[VIAI-AV train] step={global_step} "
                 f"loss={model.loss_total_item:.6f} "
+                f"av_gen={model.loss_av_gen_item:.6f} "
                 f"recon={model.loss_recon_item:.6f} "
                 f"full_l1={model.loss_full_l1_item:.6f} "
                 f"missing_l1={model.loss_missing_l1_item:.6f} "
+                f"sync={model.loss_sync_item:.6f} "
+                f"probe={model.loss_probe_gen_item:.6f} "
+                f"probe_full_l1={model.loss_probe_full_l1_item:.6f} "
+                f"probe_missing_l1={model.loss_probe_missing_l1_item:.6f} "
                 f"g_gan={model.loss_G_GAN_item:.6f} "
+                f"probe_g_gan={model.loss_probe_G_GAN_item:.6f} "
                 f"d={model.loss_D_item:.6f} "
                 f"eta1={model.eta1_item:.6f} "
+                f"eta2={model.eta2_item:.6f} "
                 f"psnr={metrics['psnr_full']:.3f} "
                 f"psnr_missing={metrics['psnr_missing']:.3f}"
                 f"{ssim_text} "
@@ -231,13 +270,23 @@ def run_phase(model, data_loader, phase, global_step, writer, global_epoch):
             break
 
     if batch_count == 0:
-        return global_step, stop_training, None
+        raise RuntimeError(
+            f"No valid VIAI-AV {phase} batches remained in epoch {global_epoch + 1}. "
+            "Check the bad-sample CSV log for skipped clips."
+        )
     averages = {
         "loss_total": totals["loss_total"] / batch_count,
+        "loss_av_gen": totals["loss_av_gen"] / batch_count,
         "loss_recon": totals["loss_recon"] / batch_count,
         "loss_full_l1": totals["loss_full_l1"] / batch_count,
         "loss_missing_l1": totals["loss_missing_l1"] / batch_count,
         "loss_g_gan": totals["loss_g_gan"] / batch_count,
+        "loss_sync": totals["loss_sync"] / batch_count,
+        "loss_probe_gen": totals["loss_probe_gen"] / batch_count,
+        "loss_probe_recon": totals["loss_probe_recon"] / batch_count,
+        "loss_probe_full_l1": totals["loss_probe_full_l1"] / batch_count,
+        "loss_probe_missing_l1": totals["loss_probe_missing_l1"] / batch_count,
+        "loss_probe_g_gan": totals["loss_probe_g_gan"] / batch_count,
         "loss_d": totals["loss_d"] / batch_count,
         "psnr_full": totals["psnr_full"] / max(1, sample_count),
         "psnr_missing": totals["psnr_missing"] / max(1, sample_count),
@@ -253,15 +302,23 @@ def run_phase(model, data_loader, phase, global_step, writer, global_epoch):
     tqdm.write(
         f"[VIAI-AV {phase}] "
         f"loss={averages['loss_total']:.6f} "
+        f"av_gen={averages['loss_av_gen']:.6f} "
         f"recon={averages['loss_recon']:.6f} "
         f"full_l1={averages['loss_full_l1']:.6f} "
         f"missing_l1={averages['loss_missing_l1']:.6f} "
+        f"sync={averages['loss_sync']:.6f} "
+        f"probe={averages['loss_probe_gen']:.6f} "
+        f"probe_full_l1={averages['loss_probe_full_l1']:.6f} "
+        f"probe_missing_l1={averages['loss_probe_missing_l1']:.6f} "
         f"g_gan={averages['loss_g_gan']:.6f} "
+        f"probe_g_gan={averages['loss_probe_g_gan']:.6f} "
         f"d={averages['loss_d']:.6f} "
         f"psnr={averages['psnr_full']:.3f} "
         f"psnr_missing={averages['psnr_missing']:.3f}"
         f"{ssim_summary}"
     )
+    if skipped_batches:
+        tqdm.write(f"[VIAI-AV {phase}] skipped_bad_batches={skipped_batches}")
     return global_step, stop_training, averages
 
 

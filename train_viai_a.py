@@ -264,6 +264,13 @@ def train_loop(model, data_loaders, writer, start_step=0, start_epoch=0):
 
 def main():
     configure_viai_a_defaults()
+    if getattr(hparams, "use_gan", False):
+        print("[VIAI-A] PatchGAN enabled; checkpoints will include netD and optimizer_D.")
+    else:
+        print(
+            "[VIAI-A] PatchGAN disabled (audio-only); "
+            "checkpoints will not contain PatchGAN discriminator weights."
+        )
     os.makedirs(hparams.checkpoint_dir, exist_ok=True)
     data_loaders = viai_a_loader.get_data_loaders(hparams.data_root, phases=("train", "val"))
     model = VIAIAModel(hparams, device=device)

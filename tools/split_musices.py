@@ -3,6 +3,8 @@ from collections import defaultdict
 import random
 from pathlib import Path
 
+from utils.av_sample_validation import BadAVSampleError, log_bad_sample, validate_av_sample
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -17,6 +19,24 @@ def parse_args():
     parser.add_argument("--val-size", type=float, default=0.05)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--max-samples", type=int, default=None)
+    parser.add_argument("--sample-rate", type=int, default=16000)
+    parser.add_argument("--hop-size", type=int, default=320)
+    parser.add_argument("--max-time-steps", type=int, default=64000)
+    parser.add_argument("--image-hope-size", type=int, default=1)
+    parser.add_argument("--visual-frame-count", type=int, default=50)
+    parser.add_argument("--visual-frame-interval-sec", type=float, default=0.08)
+    parser.add_argument(
+        "--bad-sample-log",
+        "--bad_sample_log",
+        dest="bad_sample_log",
+        default=None,
+    )
+    parser.add_argument(
+        "--strict-av-samples",
+        "--strict_av_samples",
+        dest="strict_av_samples",
+        action="store_true",
+    )
     parser.add_argument(
         "--audio-only",
         action="store_true",
@@ -85,7 +105,7 @@ def discover_sample_dirs(processed_root, audio_only=False):
     return filtered
 
 
-def discover_samples(data_root, processed_dir, max_samples=None, audio_only=False):
+def discover_samples(data_root, processed_dir, max_samples=None, audio_only=False, args=None):
     import numpy as np
     from tqdm import tqdm
 
@@ -95,6 +115,7 @@ def discover_samples(data_root, processed_dir, max_samples=None, audio_only=Fals
 
     sample_dirs = discover_sample_dirs(processed_root, audio_only=audio_only)
     rows = []
+    invalid_count = 0
     progress = tqdm(
         sample_dirs,
         desc="[split_musices] scanning",
@@ -107,6 +128,28 @@ def discover_samples(data_root, processed_dir, max_samples=None, audio_only=Fals
 
         mel_path = sample_dir / "mel.npy"
         audio_path = sample_dir / "raw_audio.npy"
+        if not audio_only:
+            try:
+                validate_av_sample(sample_dir, args)
+            except BadAVSampleError as exc:
+                if args.strict_av_samples:
+                    raise
+                invalid_count += 1
+                log_path = log_bad_sample(
+                    data_root,
+                    args.bad_sample_log,
+                    source="split-data",
+                    phase="",
+                    split_name="",
+                    sample_path=sample_dir,
+                    error=exc,
+                )
+                progress.write(
+                    f"[split_musices] excluded invalid AV sample: "
+                    f"{sample_dir.relative_to(data_root).as_posix()} "
+                    f"reason={exc.reason} log={log_path}"
+                )
+                continue
         mel = np.load(mel_path, mmap_mode="r")
         rows.append(
             {
@@ -120,7 +163,11 @@ def discover_samples(data_root, processed_dir, max_samples=None, audio_only=Fals
 
     if max_samples is not None:
         rows = rows[:max_samples]
+    discover_samples.invalid_count = invalid_count
     return rows
+
+
+discover_samples.invalid_count = 0
 
 
 def split_count(total, ratio, allow_empty):
@@ -200,6 +247,7 @@ def main():
         args.processed_dir,
         args.max_samples,
         audio_only=args.audio_only,
+        args=args,
     )
     if not rows:
         if args.audio_only:
@@ -228,6 +276,12 @@ def main():
         f"val={len(val_items)} samples/{len(split_keys['val'])} videos ({outputs['val'][0]}), "
         f"test={len(test_items)} samples/{len(split_keys['test'])} videos ({outputs['test'][0]})"
     )
+    if not args.audio_only and discover_samples.invalid_count:
+        log_path = args.bad_sample_log or (data_root / "viai_av_bad_samples.csv")
+        print(
+            f"[split_musices] excluded {discover_samples.invalid_count} invalid AV samples; "
+            f"details: {log_path}"
+        )
 
 
 if __name__ == "__main__":

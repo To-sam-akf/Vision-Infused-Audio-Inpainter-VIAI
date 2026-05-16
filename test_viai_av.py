@@ -4,6 +4,7 @@ import os
 import re
 import sys
 
+import numpy as np
 import torch
 import torch.backends.cudnn as cudnn
 from tqdm import tqdm
@@ -11,6 +12,7 @@ from tqdm import tqdm
 import Options_inpainting
 from Data_loaders import audio_loader as av_loader
 from Models.VIAI_AV_inpainting import VIAIAVModel
+from utils import util
 from utils.viai_a_metrics import compute_viai_a_metrics, save_mel_comparison_batch
 
 
@@ -29,18 +31,40 @@ RESULT_FIELDS = [
     "test_split_name",
     "stage",
     "use_gan",
+    "enable_sync_loss",
+    "enable_probe_loss",
     "num_samples",
     "loss_total",
+    "loss_av_gen",
     "loss_recon",
     "loss_g_gan",
+    "loss_sync",
+    "loss_probe_gen",
+    "loss_probe_recon",
+    "loss_probe_g_gan",
     "loss_d",
     "eta1",
+    "eta2",
     "beta_gan",
     "mel_l1_full",
     "mel_l1_missing",
+    "probe_l1_full",
+    "probe_l1_missing",
     "psnr_full",
     "psnr_missing",
     "ssim",
+    "retrieval_audio_to_video_r1",
+    "retrieval_audio_to_video_r5",
+    "retrieval_audio_to_video_r10",
+    "retrieval_audio_to_video_r50",
+    "retrieval_audio_to_video_medr",
+    "retrieval_audio_to_video_meanr",
+    "retrieval_video_to_audio_r1",
+    "retrieval_video_to_audio_r5",
+    "retrieval_video_to_audio_r10",
+    "retrieval_video_to_audio_r50",
+    "retrieval_video_to_audio_medr",
+    "retrieval_video_to_audio_meanr",
 ]
 
 
@@ -116,18 +140,29 @@ def mel_image_output_dir(results_dir, checkpoint_step_value):
 def evaluate(model, data_loader, image_dir=None):
     totals = {
         "loss_total": 0.0,
+        "loss_av_gen": 0.0,
         "loss_recon": 0.0,
         "loss_g_gan": 0.0,
+        "loss_sync": 0.0,
+        "loss_probe_gen": 0.0,
+        "loss_probe_recon": 0.0,
+        "loss_probe_g_gan": 0.0,
         "loss_d": 0.0,
         "eta1": 0.0,
+        "eta2": 0.0,
         "full_l1": 0.0,
         "missing_l1": 0.0,
+        "probe_full_l1": 0.0,
+        "probe_missing_l1": 0.0,
         "full_psnr": 0.0,
         "missing_psnr": 0.0,
         "ssim": 0.0,
     }
     sample_count = 0
     batch_count = 0
+    skipped_batches = 0
+    audio_embeddings = []
+    video_embeddings = []
 
     progress = tqdm(
         data_loader,
@@ -136,6 +171,10 @@ def evaluate(model, data_loader, image_dir=None):
         dynamic_ncols=True,
     )
     for data in progress:
+        if data is None:
+            skipped_batches += 1
+            progress.set_postfix(skipped_batches=skipped_batches)
+            continue
         model.get_blank_space_length(0)
         model.set_inputs(data)
         model.test()
@@ -144,15 +183,25 @@ def evaluate(model, data_loader, image_dir=None):
         batch_size = metrics["num_samples"]
 
         totals["loss_total"] += model.loss_total_item
+        totals["loss_av_gen"] += model.loss_av_gen_item
         totals["loss_recon"] += model.loss_recon_item
         totals["loss_g_gan"] += model.loss_G_GAN_item
+        totals["loss_sync"] += model.loss_sync_item
+        totals["loss_probe_gen"] += model.loss_probe_gen_item
+        totals["loss_probe_recon"] += model.loss_probe_recon_item
+        totals["loss_probe_g_gan"] += model.loss_probe_G_GAN_item
         totals["loss_d"] += model.loss_D_item
         totals["eta1"] += model.eta1_item
+        totals["eta2"] += model.eta2_item
         totals["full_l1"] += model.loss_full_l1_item
         totals["missing_l1"] += model.loss_missing_l1_item
+        totals["probe_full_l1"] += model.loss_probe_full_l1_item
+        totals["probe_missing_l1"] += model.loss_probe_missing_l1_item
         totals["full_psnr"] += metrics["full_psnr"]
         totals["missing_psnr"] += metrics["missing_psnr"]
         totals["ssim"] += metrics["ssim"]
+        audio_embeddings.append(util.to_np(model.mel_net_norm))
+        video_embeddings.append(util.to_np(model.video_net_norm))
         sample_count += batch_size
         batch_count += 1
         if image_dir is not None:
@@ -167,6 +216,8 @@ def evaluate(model, data_loader, image_dir=None):
         progress.set_postfix(
             loss=f"{model.loss_total_item:.4f}",
             recon=f"{model.loss_recon_item:.4f}",
+            sync=f"{model.loss_sync_item:.4f}",
+            probe=f"{model.loss_probe_gen_item:.4f}",
             g_gan=f"{model.loss_G_GAN_item:.4f}",
             d=f"{model.loss_D_item:.4f}",
             psnr=f"{metrics['full_psnr'] / batch_size:.2f}",
@@ -175,42 +226,81 @@ def evaluate(model, data_loader, image_dir=None):
 
     if batch_count == 0:
         raise RuntimeError("VIAI-AV test dataloader is empty.")
+    audio_embeddings = np.concatenate(audio_embeddings, axis=0)
+    video_embeddings = np.concatenate(video_embeddings, axis=0)
+    audio_to_video = util.L2retrieval(video_embeddings, audio_embeddings)
+    video_to_audio = util.L2retrieval(audio_embeddings, video_embeddings)
     return {
         "loss_total": totals["loss_total"] / batch_count,
+        "loss_av_gen": totals["loss_av_gen"] / batch_count,
         "loss_recon": totals["loss_recon"] / batch_count,
         "loss_g_gan": totals["loss_g_gan"] / batch_count,
+        "loss_sync": totals["loss_sync"] / batch_count,
+        "loss_probe_gen": totals["loss_probe_gen"] / batch_count,
+        "loss_probe_recon": totals["loss_probe_recon"] / batch_count,
+        "loss_probe_g_gan": totals["loss_probe_g_gan"] / batch_count,
         "loss_d": totals["loss_d"] / batch_count,
         "eta1": totals["eta1"] / batch_count,
+        "eta2": totals["eta2"] / batch_count,
         "mel_l1_full": totals["full_l1"] / batch_count,
         "mel_l1_missing": totals["missing_l1"] / batch_count,
+        "probe_l1_full": totals["probe_full_l1"] / batch_count,
+        "probe_l1_missing": totals["probe_missing_l1"] / batch_count,
         "psnr_full": totals["full_psnr"] / sample_count,
         "psnr_missing": totals["missing_psnr"] / sample_count,
         "ssim": totals["ssim"] / sample_count,
         "num_samples": sample_count,
+        "retrieval_audio_to_video": audio_to_video,
+        "retrieval_video_to_audio": video_to_audio,
+        "skipped_batches": skipped_batches,
     }
 
 
 def build_result_record(checkpoint_path, checkpoint_step_value, global_step, global_epoch, results):
+    audio_to_video = results["retrieval_audio_to_video"]
+    video_to_audio = results["retrieval_video_to_audio"]
     return {
         "checkpoint_path": os.path.abspath(checkpoint_path),
         "checkpoint_step": int(checkpoint_step_value),
         "global_step": int(global_step),
         "global_epoch": int(global_epoch),
         "test_split_name": hparams.test_split_name,
-        "stage": "VIAI-AV-stage3",
+        "stage": "VIAI-AV-stage4-sync-probe",
         "use_gan": True,
+        "enable_sync_loss": not bool(getattr(hparams, "disable_sync_loss", False)),
+        "enable_probe_loss": not bool(getattr(hparams, "disable_probe_loss", False)),
         "num_samples": int(results["num_samples"]),
         "loss_total": float(results["loss_total"]),
+        "loss_av_gen": float(results["loss_av_gen"]),
         "loss_recon": float(results["loss_recon"]),
         "loss_g_gan": float(results["loss_g_gan"]),
+        "loss_sync": float(results["loss_sync"]),
+        "loss_probe_gen": float(results["loss_probe_gen"]),
+        "loss_probe_recon": float(results["loss_probe_recon"]),
+        "loss_probe_g_gan": float(results["loss_probe_g_gan"]),
         "loss_d": float(results["loss_d"]),
         "eta1": float(results["eta1"]),
+        "eta2": float(results["eta2"]),
         "beta_gan": float(getattr(hparams, "beta_gan", 0.1)),
         "mel_l1_full": float(results["mel_l1_full"]),
         "mel_l1_missing": float(results["mel_l1_missing"]),
+        "probe_l1_full": float(results["probe_l1_full"]),
+        "probe_l1_missing": float(results["probe_l1_missing"]),
         "psnr_full": float(results["psnr_full"]),
         "psnr_missing": float(results["psnr_missing"]),
         "ssim": float(results["ssim"]),
+        "retrieval_audio_to_video_r1": float(audio_to_video[0]),
+        "retrieval_audio_to_video_r5": float(audio_to_video[1]),
+        "retrieval_audio_to_video_r10": float(audio_to_video[2]),
+        "retrieval_audio_to_video_r50": float(audio_to_video[3]),
+        "retrieval_audio_to_video_medr": float(audio_to_video[4]),
+        "retrieval_audio_to_video_meanr": float(audio_to_video[5]),
+        "retrieval_video_to_audio_r1": float(video_to_audio[0]),
+        "retrieval_video_to_audio_r5": float(video_to_audio[1]),
+        "retrieval_video_to_audio_r10": float(video_to_audio[2]),
+        "retrieval_video_to_audio_r50": float(video_to_audio[3]),
+        "retrieval_video_to_audio_medr": float(video_to_audio[4]),
+        "retrieval_video_to_audio_meanr": float(video_to_audio[5]),
     }
 
 
@@ -219,16 +309,36 @@ def coerce_csv_record(row):
     int_fields = {"checkpoint_step", "global_step", "global_epoch", "num_samples"}
     float_fields = {
         "loss_total",
+        "loss_av_gen",
         "loss_recon",
         "loss_g_gan",
+        "loss_sync",
+        "loss_probe_gen",
+        "loss_probe_recon",
+        "loss_probe_g_gan",
         "loss_d",
         "eta1",
+        "eta2",
         "beta_gan",
         "mel_l1_full",
         "mel_l1_missing",
+        "probe_l1_full",
+        "probe_l1_missing",
         "psnr_full",
         "psnr_missing",
         "ssim",
+        "retrieval_audio_to_video_r1",
+        "retrieval_audio_to_video_r5",
+        "retrieval_audio_to_video_r10",
+        "retrieval_audio_to_video_r50",
+        "retrieval_audio_to_video_medr",
+        "retrieval_audio_to_video_meanr",
+        "retrieval_video_to_audio_r1",
+        "retrieval_video_to_audio_r5",
+        "retrieval_video_to_audio_r10",
+        "retrieval_video_to_audio_r50",
+        "retrieval_video_to_audio_medr",
+        "retrieval_video_to_audio_meanr",
     }
     for field in RESULT_FIELDS:
         value = row.get(field, "")
@@ -308,15 +418,40 @@ def main():
         "[VIAI-AV test] "
         f"samples={results['num_samples']} "
         f"loss={results['loss_total']:.6f} "
+        f"av_gen={results['loss_av_gen']:.6f} "
         f"recon={results['loss_recon']:.6f} "
+        f"sync={results['loss_sync']:.6f} "
+        f"probe={results['loss_probe_gen']:.6f} "
         f"g_gan={results['loss_g_gan']:.6f} "
+        f"probe_g_gan={results['loss_probe_g_gan']:.6f} "
         f"d={results['loss_d']:.6f} "
         f"eta1={results['eta1']:.6f} "
+        f"eta2={results['eta2']:.6f} "
         f"mel_l1_full={results['mel_l1_full']:.6f} "
         f"mel_l1_missing={results['mel_l1_missing']:.6f} "
+        f"probe_l1_full={results['probe_l1_full']:.6f} "
+        f"probe_l1_missing={results['probe_l1_missing']:.6f} "
         f"psnr_full={results['psnr_full']:.3f} "
         f"psnr_missing={results['psnr_missing']:.3f} "
         f"ssim={results['ssim']:.4f}"
+    )
+    print(
+        "[VIAI-AV test] audio->video retrieval "
+        f"R@1={results['retrieval_audio_to_video'][0]:.2f} "
+        f"R@5={results['retrieval_audio_to_video'][1]:.2f} "
+        f"R@10={results['retrieval_audio_to_video'][2]:.2f} "
+        f"R@50={results['retrieval_audio_to_video'][3]:.2f} "
+        f"MedR={results['retrieval_audio_to_video'][4]:.1f} "
+        f"MeanR={results['retrieval_audio_to_video'][5]:.1f}"
+    )
+    print(
+        "[VIAI-AV test] video->audio retrieval "
+        f"R@1={results['retrieval_video_to_audio'][0]:.2f} "
+        f"R@5={results['retrieval_video_to_audio'][1]:.2f} "
+        f"R@10={results['retrieval_video_to_audio'][2]:.2f} "
+        f"R@50={results['retrieval_video_to_audio'][3]:.2f} "
+        f"MedR={results['retrieval_video_to_audio'][4]:.1f} "
+        f"MeanR={results['retrieval_video_to_audio'][5]:.1f}"
     )
     print(f"[VIAI-AV test] wrote json: {json_path}")
     print(f"[VIAI-AV test] wrote summary csv: {csv_path}")

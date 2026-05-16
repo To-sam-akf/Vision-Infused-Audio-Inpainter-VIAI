@@ -8,6 +8,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from utils.av_sample_validation import BadAVSampleError, validate_av_sample
+
 
 YT_DLP_FORMAT = "mp4/bestvideo+bestaudio/best"
 DOWNLOAD_PROGRESS_TEMPLATE = (
@@ -1222,12 +1224,15 @@ def extract_frames_and_flow(
         total_read_frames = int(frame_count - start_frame)
     else:
         total_read_frames = None
+    requested_frame_count = None
     selected_offsets = None
-    if target_frame_count is not None and target_frame_count > 0 and total_read_frames:
-        target_frame_count = min(int(target_frame_count), int(total_read_frames))
+    if target_frame_count is not None and target_frame_count > 0:
+        requested_frame_count = int(target_frame_count)
+    if requested_frame_count is not None and total_read_frames:
+        selected_frame_count = min(requested_frame_count, int(total_read_frames))
         selected_offsets = set(
             int(offset)
-            for offset in np.linspace(0, total_read_frames - 1, num=target_frame_count).round()
+            for offset in np.linspace(0, total_read_frames - 1, num=selected_frame_count).round()
         )
     progress_args = args if args is not None else argparse.Namespace(progress=False)
     progress_label = label if label is not None else video_path.stem
@@ -1250,6 +1255,11 @@ def extract_frames_and_flow(
             progress.update(1)
     cap.release()
 
+    if requested_frame_count is not None and len(frames) < requested_frame_count:
+        raise RuntimeError(
+            f"Not enough visual frames in clip: need {requested_frame_count}, "
+            f"found {len(frames)} after reading {video_path}"
+        )
     if len(frames) < 2:
         raise RuntimeError(f"Video segment too short to extract optical flow: {video_path}")
 
@@ -1414,7 +1424,7 @@ def extract_audio_from_video(video_path, wav_path, ffmpeg_binary, skip_existing,
     return wav_path
 
 
-def processed_sample_ready(sample_dir):
+def processed_sample_ready(sample_dir, args=None):
     required_files = [
         sample_dir / "raw_audio.npy",
         sample_dir / "mel.npy",
@@ -1424,7 +1434,15 @@ def processed_sample_ready(sample_dir):
         sample_dir / "flow_x_crop",
         sample_dir / "flow_y_crop",
     ]
-    return all(path.exists() for path in required_files) and all(path.exists() for path in required_dirs)
+    if not (all(path.exists() for path in required_files) and all(path.exists() for path in required_dirs)):
+        return False
+    if args is None:
+        return True
+    try:
+        validate_av_sample(sample_dir, args)
+    except BadAVSampleError:
+        return False
+    return True
 
 
 def clean_direct_sample_payload(sample_dir):
@@ -1464,7 +1482,7 @@ def process_clip(record, args, ffmpeg_binary, segment_id, clip_id, start_sec, du
         f"clip{clip_id}"
     )
 
-    if args.skip_existing and processed_sample_ready(sample_dir):
+    if args.skip_existing and processed_sample_ready(sample_dir, args=args):
         return {
             "sample_dir": sample_dir,
             "mel_frames": None,

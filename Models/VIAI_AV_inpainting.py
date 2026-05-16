@@ -5,11 +5,12 @@ import torch
 import torch.nn as nn
 
 from Data_loaders import mel_loader
-from loss_functions import GANLoss
+from loss_functions import GANLoss, L2ContrastiveLoss
 from networks import Discriminator_Networks
 from networks import Image_Embedding
 from networks import Inpainting_Networks
 from networks import New_Inpainting_Networks
+from utils import util
 
 
 def _copy_matching_state(module, source_state, label):
@@ -35,6 +36,8 @@ class VIAIAVModel(object):
         self.hparams = hparams
         self.device = device if device is not None else torch.device("cpu")
         self.use_gan = True
+        self.enable_sync_loss = not bool(getattr(hparams, "disable_sync_loss", False))
+        self.enable_probe_loss = not bool(getattr(hparams, "disable_probe_loss", False))
 
         self.Mel_Encoder = Inpainting_Networks.MelEncoder(hparams=hparams).to(self.device)
         self.VideoEncoder = Image_Embedding.ImageEmbedding(hparams=hparams).to(self.device)
@@ -43,6 +46,10 @@ class VIAIAVModel(object):
 
         self.criterion_l1 = nn.L1Loss()
         self.criterion_gan = GANLoss(use_lsgan=False, device=self.device)
+        self.criterion_sync = L2ContrastiveLoss(
+            margin=getattr(hparams, "sync_margin", 1.0),
+            max_violation=False,
+        )
 
         generator_params = (
             list(self.Mel_Encoder.parameters())
@@ -63,14 +70,22 @@ class VIAIAVModel(object):
         self.blank_length = getattr(hparams, "min_blank_frames", 20)
 
         self.loss_total_item = 0.0
+        self.loss_av_gen_item = 0.0
         self.loss_recon_item = 0.0
         self.loss_full_l1_item = 0.0
         self.loss_missing_l1_item = 0.0
         self.loss_G_GAN_item = 0.0
+        self.loss_sync_item = 0.0
+        self.loss_probe_gen_item = 0.0
+        self.loss_probe_recon_item = 0.0
+        self.loss_probe_full_l1_item = 0.0
+        self.loss_probe_missing_l1_item = 0.0
+        self.loss_probe_G_GAN_item = 0.0
         self.loss_D_item = 0.0
         self.loss_D_real_item = 0.0
         self.loss_D_fake_item = 0.0
         self.eta1_item = 0.0
+        self.eta2_item = 0.0
 
     def _eta(self, step, base, interval, floor):
         if interval <= 0:
@@ -123,35 +138,100 @@ class VIAIAVModel(object):
     def _forward_inpainter(self):
         self.mel_features = self.Mel_Encoder(self.mel_input)
         self.video_feature = self.VideoEncoder(self.video_batch, self.flow_batch)
+        self.mel_target_features = self.Mel_Encoder(self.mel_target)
+        self.mel_target_feature_flat = self.mel_target_features[-1].flatten(1)
+        self.video_feature_flat = self.video_feature.flatten(1)
+        self.mel_net_norm = util.l2_norm(self.mel_target_feature_flat.detach())
+        self.video_net_norm = util.l2_norm(self.video_feature_flat)
         self.mel_pred = self.Mel_Decoder(
             self.mel_features,
             self.mel_input_4d.size(),
             self.video_feature,
         )
+        if self.enable_probe_loss:
+            self.mel_probe_pred = self.Mel_Decoder(
+                self.mel_features,
+                self.mel_input_4d.size(),
+                self.mel_target_features[-1],
+            )
+        else:
+            self.mel_probe_pred = None
         return self.mel_pred
 
+    def _zero_loss_like(self, reference):
+        return torch.zeros((), device=self.device, dtype=reference.dtype)
+
+    def _reconstruction_losses(self, prediction):
+        loss_full_l1 = self.criterion_l1(prediction, self.mel_target_4d)
+        masked_abs = torch.abs(prediction - self.mel_target_4d) * self.missing_mask
+        loss_missing_l1 = masked_abs.sum() / torch.clamp(self.missing_mask.sum(), min=1.0)
+        loss_recon = self.eta1 * loss_full_l1 + loss_missing_l1
+        return loss_recon, loss_full_l1, loss_missing_l1
+
     def _compute_losses(self, global_step):
-        self.loss_full_l1 = self.criterion_l1(self.mel_pred, self.mel_target_4d)
-        masked_abs = torch.abs(self.mel_pred - self.mel_target_4d) * self.missing_mask
-        self.loss_missing_l1 = masked_abs.sum() / torch.clamp(self.missing_mask.sum(), min=1.0)
         self.eta1 = self._eta(
             global_step,
             getattr(self.hparams, "recon_decay_base", 0.9),
             getattr(self.hparams, "recon_decay_interval", 1000.0),
             getattr(self.hparams, "recon_decay_floor", 0.1),
         )
-        self.loss_recon = self.eta1 * self.loss_full_l1 + self.loss_missing_l1
+        self.eta2 = self._eta(
+            global_step,
+            getattr(self.hparams, "probe_decay_base", getattr(self.hparams, "sync_decay_base", 0.9)),
+            getattr(
+                self.hparams,
+                "probe_decay_interval",
+                getattr(self.hparams, "sync_decay_interval", 1000.0),
+            ),
+            getattr(self.hparams, "probe_decay_floor", getattr(self.hparams, "sync_decay_floor", 0.1)),
+        )
+        self.loss_recon, self.loss_full_l1, self.loss_missing_l1 = self._reconstruction_losses(
+            self.mel_pred
+        )
 
         pred_fake = self.netD(self.mel_pred)
         self.loss_G_GAN = self.criterion_gan(pred_fake, True)
         beta_gan = getattr(self.hparams, "beta_gan", 0.1)
-        self.loss_total = self.loss_G_GAN + beta_gan * self.loss_recon
+        self.loss_av_gen = self.loss_G_GAN + beta_gan * self.loss_recon
+
+        if self.enable_sync_loss:
+            self.loss_sync = self.criterion_sync(self.mel_net_norm, self.video_net_norm)
+        else:
+            self.loss_sync = self._zero_loss_like(self.loss_av_gen)
+
+        if self.enable_probe_loss and self.mel_probe_pred is not None:
+            (
+                self.loss_probe_recon,
+                self.loss_probe_full_l1,
+                self.loss_probe_missing_l1,
+            ) = self._reconstruction_losses(self.mel_probe_pred)
+            pred_probe_fake = self.netD(self.mel_probe_pred)
+            self.loss_probe_G_GAN = self.criterion_gan(pred_probe_fake, True)
+            self.loss_probe_gen = self.loss_probe_G_GAN + beta_gan * self.loss_probe_recon
+        else:
+            self.loss_probe_recon = self._zero_loss_like(self.loss_av_gen)
+            self.loss_probe_full_l1 = self._zero_loss_like(self.loss_av_gen)
+            self.loss_probe_missing_l1 = self._zero_loss_like(self.loss_av_gen)
+            self.loss_probe_G_GAN = self._zero_loss_like(self.loss_av_gen)
+            self.loss_probe_gen = self._zero_loss_like(self.loss_av_gen)
+
+        lambda_sync = getattr(self.hparams, "lambda_sync", 1.0)
+        lambda_probe = getattr(self.hparams, "lambda_probe", 1.0)
+        self.loss_total = (
+            self.loss_av_gen
+            + lambda_sync * self.loss_sync
+            + lambda_probe * self.eta2 * self.loss_probe_gen
+        )
 
     def _compute_discriminator_loss(self):
         pred_real = self.netD(self.mel_target_4d)
-        pred_fake = self.netD(self.mel_pred.detach())
+        fake_losses = [self.criterion_gan(self.netD(self.mel_pred.detach()), False, softlabel=True)]
+        if self.enable_probe_loss and self.mel_probe_pred is not None:
+            fake_losses.append(
+                self.criterion_gan(self.netD(self.mel_probe_pred.detach()), False, softlabel=True)
+            )
         self.loss_D_real = self.criterion_gan(pred_real, True, softlabel=True)
-        self.loss_D_fake = self.criterion_gan(pred_fake, False, softlabel=True)
+        self.loss_D_fake = sum(fake_losses) / len(fake_losses)
         self.loss_D = 0.5 * (self.loss_D_real + self.loss_D_fake)
 
     def optimize_parameters(self, global_step):
@@ -184,27 +264,43 @@ class VIAIAVModel(object):
 
     def get_loss_items(self):
         self.loss_total_item = float(self.loss_total.detach().cpu().item())
+        self.loss_av_gen_item = float(self.loss_av_gen.detach().cpu().item())
         self.loss_recon_item = float(self.loss_recon.detach().cpu().item())
         self.loss_full_l1_item = float(self.loss_full_l1.detach().cpu().item())
         self.loss_missing_l1_item = float(self.loss_missing_l1.detach().cpu().item())
         self.loss_G_GAN_item = float(self.loss_G_GAN.detach().cpu().item())
+        self.loss_sync_item = float(self.loss_sync.detach().cpu().item())
+        self.loss_probe_gen_item = float(self.loss_probe_gen.detach().cpu().item())
+        self.loss_probe_recon_item = float(self.loss_probe_recon.detach().cpu().item())
+        self.loss_probe_full_l1_item = float(self.loss_probe_full_l1.detach().cpu().item())
+        self.loss_probe_missing_l1_item = float(self.loss_probe_missing_l1.detach().cpu().item())
+        self.loss_probe_G_GAN_item = float(self.loss_probe_G_GAN.detach().cpu().item())
         self.loss_D_item = float(self.loss_D.detach().cpu().item())
         self.loss_D_real_item = float(self.loss_D_real.detach().cpu().item())
         self.loss_D_fake_item = float(self.loss_D_fake.detach().cpu().item())
         self.eta1_item = float(self.eta1)
+        self.eta2_item = float(self.eta2)
 
     def TF_writer(self, writer, step, prefix="train"):
         if writer is None:
             return
         writer.add_scalar(f"{prefix}/loss_total", self.loss_total_item, step)
+        writer.add_scalar(f"{prefix}/loss_av_gen", self.loss_av_gen_item, step)
         writer.add_scalar(f"{prefix}/loss_recon", self.loss_recon_item, step)
         writer.add_scalar(f"{prefix}/loss_full_l1", self.loss_full_l1_item, step)
         writer.add_scalar(f"{prefix}/loss_missing_l1", self.loss_missing_l1_item, step)
         writer.add_scalar(f"{prefix}/loss_g_gan", self.loss_G_GAN_item, step)
+        writer.add_scalar(f"{prefix}/loss_sync", self.loss_sync_item, step)
+        writer.add_scalar(f"{prefix}/loss_probe_gen", self.loss_probe_gen_item, step)
+        writer.add_scalar(f"{prefix}/loss_probe_recon", self.loss_probe_recon_item, step)
+        writer.add_scalar(f"{prefix}/loss_probe_full_l1", self.loss_probe_full_l1_item, step)
+        writer.add_scalar(f"{prefix}/loss_probe_missing_l1", self.loss_probe_missing_l1_item, step)
+        writer.add_scalar(f"{prefix}/loss_probe_g_gan", self.loss_probe_G_GAN_item, step)
         writer.add_scalar(f"{prefix}/loss_d", self.loss_D_item, step)
         writer.add_scalar(f"{prefix}/loss_d_real", self.loss_D_real_item, step)
         writer.add_scalar(f"{prefix}/loss_d_fake", self.loss_D_fake_item, step)
         writer.add_scalar(f"{prefix}/eta1", self.eta1_item, step)
+        writer.add_scalar(f"{prefix}/eta2", self.eta2_item, step)
 
     def save_checkpoint(self, global_step, global_epoch, checkpoint_dir):
         os.makedirs(checkpoint_dir, exist_ok=True)
@@ -226,7 +322,9 @@ class VIAIAVModel(object):
             "global_step": global_step,
             "global_epoch": global_epoch,
             "use_gan": True,
-            "stage": "VIAI-AV-stage3",
+            "stage": "VIAI-AV-stage4-sync-probe",
+            "enable_sync_loss": self.enable_sync_loss,
+            "enable_probe_loss": self.enable_probe_loss,
         }
         torch.save(checkpoint, checkpoint_path)
         print("Saved VIAI-AV checkpoint:", checkpoint_path)
@@ -267,5 +365,8 @@ class VIAIAVModel(object):
         if "netD" in checkpoint:
             _copy_matching_state(self.netD, checkpoint["netD"], "MelDiscriminator")
         else:
-            print("[VIAI-AV] source checkpoint has no netD; discriminator remains random")
+            print(
+                "[VIAI-AV] source checkpoint has no netD; "
+                "MelDiscriminator remains randomly initialized and will be trained by VIAI-AV"
+            )
         return int(checkpoint.get("global_step", 0)), int(checkpoint.get("global_epoch", 0))
