@@ -45,6 +45,8 @@ class VIAIAModel(object):
         self.loss_full_l1_item = 0.0
         self.loss_missing_l1_item = 0.0
         self.loss_G_GAN_item = 0.0
+        self.weighted_loss_recon_item = 0.0
+        self.weighted_loss_gan_item = 0.0
         self.loss_D_item = 0.0
         self.loss_D_real_item = 0.0
         self.loss_D_fake_item = 0.0
@@ -93,9 +95,15 @@ class VIAIAModel(object):
         if self.use_gan:
             pred_fake = self.netD(self.mel_pred)
             self.loss_G_GAN = self.criterion_gan(pred_fake, True)
-            beta_gan = getattr(self.hparams, "beta_gan", 0.1)
-            self.loss_total = self.loss_G_GAN + beta_gan * self.loss_recon
+            lambda_recon = getattr(self.hparams, "lambda_recon", 1.0)
+            self.weighted_loss_recon = lambda_recon * self.loss_recon
+            self.weighted_loss_gan = self.loss_G_GAN
+            self.loss_total = self.weighted_loss_gan + self.weighted_loss_recon
         else:
+            self.weighted_loss_recon = self.loss_recon
+            self.weighted_loss_gan = torch.zeros(
+                (), device=self.device, dtype=self.loss_recon.dtype
+            )
             self.loss_total = self.loss_recon
 
     def _compute_discriminator_loss(self):
@@ -124,14 +132,14 @@ class VIAIAModel(object):
             self.optimizer_D.step()
         self.current_lr = self.optimizer_G.param_groups[0]["lr"]
 
-    def test(self):
+    def test(self, global_step=0):
         self.Mel_Encoder.eval()
         self.Mel_Decoder.eval()
         if self.use_gan:
             self.netD.eval()
         with torch.no_grad():
             self._forward_inpainter()
-            self._compute_losses(global_step=0)
+            self._compute_losses(global_step=global_step)
             self._compute_discriminator_loss()
 
     def get_loss_items(self):
@@ -142,6 +150,8 @@ class VIAIAModel(object):
         self.loss_recon_item = float(self.loss_recon.detach().cpu().item())
         self.loss_full_l1_item = float(self.loss_full_l1.detach().cpu().item())
         self.loss_missing_l1_item = float(self.loss_missing_l1.detach().cpu().item())
+        self.weighted_loss_recon_item = float(self.weighted_loss_recon.detach().cpu().item())
+        self.weighted_loss_gan_item = float(self.weighted_loss_gan.detach().cpu().item())
         self.eta1_item = float(self.eta1)
         if self.use_gan:
             self.loss_G_GAN_item = float(self.loss_G_GAN.detach().cpu().item())
@@ -175,6 +185,8 @@ class VIAIAModel(object):
         if self.use_gan:
             writer.add_scalar(f"{prefix}/loss_recon", self.loss_recon_item, step)
             writer.add_scalar(f"{prefix}/loss_g_gan", self.loss_G_GAN_item, step)
+            writer.add_scalar(f"{prefix}/weighted_loss_recon", self.weighted_loss_recon_item, step)
+            writer.add_scalar(f"{prefix}/weighted_loss_gan", self.weighted_loss_gan_item, step)
             writer.add_scalar(f"{prefix}/loss_d", self.loss_D_item, step)
             writer.add_scalar(f"{prefix}/loss_d_real", self.loss_D_real_item, step)
             writer.add_scalar(f"{prefix}/loss_d_fake", self.loss_D_fake_item, step)

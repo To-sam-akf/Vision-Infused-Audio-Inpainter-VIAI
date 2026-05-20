@@ -169,10 +169,14 @@ class AudioModel(object):
         else:
             self.EmbeddingL2 = torch.zeros(1, device=self.device, dtype=self.loss_mel_L1.dtype).squeeze(0)
 
-        beta_gan = getattr(self.hparams, "beta_gan", 0.1)
+        lambda_gan = getattr(self.hparams, "lambda_gan", 1.0)
         lambda_sync = getattr(self.hparams, "lambda_sync", 1.0)
         lambda_recon = getattr(self.hparams, "lambda_recon", 1.0)
-        self.loss_G = lambda_recon * self.loss_mel_L1 + beta_gan * self.loss_G_GAN + lambda_sync * self.EmbeddingL2
+        self.loss_G = (
+            lambda_recon * self.loss_mel_L1
+            + lambda_gan * self.loss_G_GAN
+            + lambda_sync * self.EmbeddingL2
+        )
 
         pred_real = self.netD(self.mel_target_4d)
         pred_fake_detach = self.netD(self.mel_pred.detach())

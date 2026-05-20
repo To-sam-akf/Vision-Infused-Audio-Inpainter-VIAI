@@ -20,9 +20,9 @@ class BaseOptions(object):
         self.parser.add_argument("--test_size", type=float, default=0.05)
         self.parser.add_argument("--metadata_name", type=str, default="metadata.csv")
         self.parser.add_argument("--new_split_name", type=str, default="_new_split.txt")
-        self.parser.add_argument("--train_split_name", type=str, default="train_new_split.txt")
-        self.parser.add_argument("--val_split_name", type=str, default="val_new_split.txt")
-        self.parser.add_argument("--test_split_name", type=str, default="test_new_split.txt")
+        self.parser.add_argument("--train_split_name", type=str, default="train_av_split.txt")
+        self.parser.add_argument("--val_split_name", type=str, default="val_av_split.txt")
+        self.parser.add_argument("--test_split_name", type=str, default="test_av_split.txt")
 
         # Resume / checkpoint
         self.parser.add_argument("--resume", action="store_true")
@@ -118,8 +118,8 @@ class BaseOptions(object):
             action="store_true",
             help="For VIAI-A stage 2, enable PatchGAN discriminator and GAN loss.",
         )
+        self.parser.add_argument("--lambda_gan", type=float, default=1.0)
         self.parser.add_argument("--lambda_recon", type=float, default=1.0)
-        self.parser.add_argument("--beta_gan", type=float, default=0.1)
         self.parser.add_argument("--lambda_sync", type=float, default=1.0)
         self.parser.add_argument("--lambda_probe", type=float, default=1.0)
         self.parser.add_argument("--sync_margin", type=float, default=1.0)
@@ -241,7 +241,13 @@ class BaseOptions(object):
         if not self.initialized:
             self.initialize()
         # Ignore unknown args to make config import-safe in notebooks/tools.
-        opt, _ = self.parser.parse_known_args(args=args)
+        opt, unknown = self.parser.parse_known_args(args=args)
+        deprecated_args = [arg for arg in unknown if arg == "--beta_gan" or arg.startswith("--beta_gan=")]
+        if deprecated_args:
+            self.parser.error(
+                "--beta_gan has been removed. Use --lambda_recon for the "
+                "reconstruction loss weight."
+            )
         return opt
 
     def parse(self, args=None):

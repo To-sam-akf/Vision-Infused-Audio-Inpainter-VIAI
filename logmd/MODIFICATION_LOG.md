@@ -1230,6 +1230,111 @@ mel_encoder_sync_grad_sum=0.000000
 video_encoder_sync_grad_sum=9112.837492
 ```
 
+## 2026-05-17 23:12:07 CST VIAI loss 权重命名与 TensorBoard 加权项修正
+
+### 背景
+VIAI-AV 的 beta=0.1 / beta=1 / beta=10 对照实验显示，原 `--beta_gan`
+参数名容易误导：在 VIAI-A/VIAI-AV 当前论文公式实现中，该参数实际乘在
+reconstruction loss 上，而不是 GAN loss 上。为避免后续训练继续混淆，本次统一改用
+`--lambda_recon` 表示 reconstruction loss 权重，并补充 TensorBoard 加权 loss 监控。
+
+### 修改内容
+1. `base_options.py`
+   - 移除 `--beta_gan` 参数入口。
+   - 正式使用 `--lambda_recon` 作为 reconstruction loss 权重，默认 `1.0`。
+   - 新增 `--lambda_gan`，用于旧 `Whole_Sync_inpainting_modify.py` 中原先的 GAN loss 权重语义。
+   - 若命令行继续传入 `--beta_gan`，会直接报错提示改用 `--lambda_recon`。
+
+2. `Models/VIAI_A_inpainting.py` / `Models/VIAI_AV_inpainting.py`
+   - 将 GAN 分支损失从 `loss_g_gan + beta_gan * loss_recon` 改为
+     `loss_g_gan + lambda_recon * loss_recon`。
+   - VIAI-AV probe 分支同步改为
+     `loss_probe_g_gan + lambda_recon * loss_probe_recon`。
+   - 新增运行时加权项：
+     `weighted_loss_recon`、`weighted_loss_gan`，VIAI-AV 额外新增
+     `weighted_loss_probe_gen = eta2 * loss_probe_gen`。
+   - `test()` 增加 `global_step` 参数，验证/测试阶段按传入 step 计算 `eta1/eta2`。
+
+3. `train_viai_a.py` / `train_viai_av.py`
+   - 验证阶段调用 `model.test(global_step=global_step)`，修复 `val/eta1` 永远为 1.0 的问题。
+   - TensorBoard 新增：
+     `train|val/weighted_loss_recon`、`train|val/weighted_loss_gan`；
+     VIAI-AV probe 启用时新增 `train|val/weighted_loss_probe_gen`。
+
+4. `test_viai_a.py` / `test_viai_av.py`
+   - 测试 JSON/CSV 字段移除 `beta_gan`，保留/新增 `lambda_recon`。
+   - 测试阶段按 checkpoint step 调用 `model.test(global_step=checkpoint_step)`。
+
+5. `README.md`
+   - 训练命令示例从 `--beta_gan` 改为 `--lambda_recon`。
+   - 指标说明补充 TensorBoard 加权 loss tags。
+
+### 验证结果
+```bash
+.venv/bin/python -m py_compile \
+  base_options.py \
+  Models/VIAI_A_inpainting.py \
+  Models/VIAI_AV_inpainting.py \
+  Models/Whole_Sync_inpainting_modify.py \
+  train_viai_a.py \
+  train_viai_av.py \
+  test_viai_a.py \
+  test_viai_av.py
+```
+
+静态检查已通过。
+
+VIAI-AV smoke test 已通过。由于本地没有 `data/train_av_split.txt`，验证时使用
+`train_new_split.txt` 作为本地最小 AV split，并使用同一 split 临时充当 val split：
+
+```bash
+.venv/bin/python main.py train-viai-av -- \
+  --data_root data \
+  --train_split_name train_new_split.txt \
+  --val_split_name train_new_split.txt \
+  --init_from_viai_a checkpoints/VIAI-A_checkpoint_step000000001.pth.tar \
+  --checkpoint_dir /tmp/viai_lambda_recon_smoke_val \
+  --log_event_path /tmp/viai_lambda_recon_smoke_val/events \
+  --batch_size 1 \
+  --num_workers 0 \
+  --max_train_steps 2 \
+  --lambda_recon 1.0 \
+  --display_id 0 \
+  --print_freq 1
+```
+
+关键输出：
+
+```text
+[VIAI-AV val] ... eta2=0.9999 ... step=1 ...
+[VIAI-AV val] loss=3.313268 av_gen=1.286148 recon=0.591638 ...
+Saved VIAI-AV checkpoint: /tmp/viai_lambda_recon_smoke_val/VIAI-AV_checkpoint_step000000002.pth.tar
+```
+
+TensorBoard tag 检查已通过，包含：
+
+```text
+train/weighted_loss_recon
+train/weighted_loss_gan
+train/weighted_loss_probe_gen
+val/weighted_loss_recon
+val/weighted_loss_gan
+val/weighted_loss_probe_gen
+val/eta1 = 0.999895 at step 1
+```
+
+旧参数拦截已通过：
+
+```bash
+.venv/bin/python main.py train-viai-av -- --beta_gan 0.1 --max_train_steps 0
+```
+
+输出会报错：
+
+```text
+train_viai_av: error: --beta_gan has been removed. Use --lambda_recon for the reconstruction loss weight.
+```
+
 ## 2026-05-16 VIAI 第五阶段 Griffin-Lim vocoder 输出
 
 根据 `information.md` 8.5 的路线 B，本次先接入轻量 Griffin-Lim vocoder，用于从测试阶段的修复 Mel-spectrogram 导出 waveform。该路线不训练 WaveNet，也不依赖 HiFi-GAN / WaveGlow 预训练 checkpoint；目标是先跑通端到端 demo 音频输出。

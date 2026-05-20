@@ -46,7 +46,7 @@ RESULT_FIELDS = [
     "loss_d",
     "eta1",
     "eta2",
-    "beta_gan",
+    "lambda_recon",
     "mel_l1_full",
     "mel_l1_missing",
     "probe_l1_full",
@@ -143,7 +143,7 @@ def mel_image_output_dir(results_dir, checkpoint_step_value):
     )
 
 
-def evaluate(model, data_loader, image_dir=None, vocoder_dir=None):
+def evaluate(model, data_loader, global_step=0, image_dir=None, vocoder_dir=None):
     totals = {
         "loss_total": 0.0,
         "loss_av_gen": 0.0,
@@ -185,7 +185,7 @@ def evaluate(model, data_loader, image_dir=None, vocoder_dir=None):
             continue
         model.get_blank_space_length(0)
         model.set_inputs(data)
-        model.test()
+        model.test(global_step=global_step)
         model.get_loss_items()
         metrics = batch_metrics(model)
         batch_size = metrics["num_samples"]
@@ -312,7 +312,7 @@ def build_result_record(checkpoint_path, checkpoint_step_value, global_step, glo
         "loss_d": float(results["loss_d"]),
         "eta1": float(results["eta1"]),
         "eta2": float(results["eta2"]),
-        "beta_gan": float(getattr(hparams, "beta_gan", 0.1)),
+        "lambda_recon": float(getattr(hparams, "lambda_recon", 1.0)),
         "mel_l1_full": float(results["mel_l1_full"]),
         "mel_l1_missing": float(results["mel_l1_missing"]),
         "probe_l1_full": float(results["probe_l1_full"]),
@@ -362,7 +362,7 @@ def coerce_csv_record(row):
         "loss_d",
         "eta1",
         "eta2",
-        "beta_gan",
+        "lambda_recon",
         "mel_l1_full",
         "mel_l1_missing",
         "probe_l1_full",
@@ -453,7 +453,13 @@ def main():
                 "wav",
                 f"step{format_step(checkpoint_step_value)}",
             )
-    results = evaluate(model, data_loaders["test"], image_dir=image_dir, vocoder_dir=vocoder_dir)
+    results = evaluate(
+        model,
+        data_loaders["test"],
+        global_step=checkpoint_step_value,
+        image_dir=image_dir,
+        vocoder_dir=vocoder_dir,
+    )
     result_record = build_result_record(
         checkpoint_path,
         checkpoint_step_value,

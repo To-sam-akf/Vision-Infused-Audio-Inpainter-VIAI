@@ -95,23 +95,36 @@ $DATA_ROOT/raw_videos/<instrument>/<youtube_id>.mp4
 python main.py prepare-viai-a -- \
   --json "$DATA_ROOT/MUSICES.json" \
   --data-root "$DATA_ROOT" \
+  --processed-dir processed_viai_a \
   --skip-existing
 ```
 
 输出：
 
 ```text
-$DATA_ROOT/processed/<instrument>/<youtube_id>/source.wav
-$DATA_ROOT/processed/<instrument>/<youtube_id>/raw_audio.npy
-$DATA_ROOT/processed/<instrument>/<youtube_id>/mel.npy
+$DATA_ROOT/processed_viai_a/<instrument>/<youtube_id>/source.wav
+$DATA_ROOT/processed_viai_a/<instrument>/<youtube_id>/raw_audio.npy
+$DATA_ROOT/processed_viai_a/<instrument>/<youtube_id>/mel.npy
 ```
 
 生成 audio-only split：
 
 ```bash
-python main.py split-data -- --data-root "$DATA_ROOT" --audio-only
+python main.py split-data -- \
+  --data-root "$DATA_ROOT" \
+  --processed-dir processed_viai_a \
+  --train-split-name train_viai_a_split.txt \
+  --val-split-name val_viai_a_split.txt \
+  --test-split-name test_viai_a_split.txt \
+  --audio-only
 wc -l "$DATA_ROOT/train_viai_a_split.txt" "$DATA_ROOT/val_viai_a_split.txt" "$DATA_ROOT/test_viai_a_split.txt"
+head -n 3 "$DATA_ROOT/train_viai_a_split.txt"
 ```
+
+后续 VIAI-A 训练/测试读取的是上述 split 文件中的相对路径，因此样本实际位于
+`$DATA_ROOT/processed_viai_a/...`，不再使用默认的 `$DATA_ROOT/processed/...`。
+如果之前生成过旧 split，需要重新运行上面的 `split-data` 命令覆盖它；`head` 输出的
+第一列应以 `processed_viai_a/` 开头，不能是 `processed/`。
 
 ### 3.3 生成 VIAI-AV 样本
 
@@ -130,8 +143,12 @@ python main.py prepare-data -- process \
 生成 AV split：
 
 ```bash
-python main.py split-data -- --data-root "$DATA_ROOT"
-wc -l "$DATA_ROOT/train_new_split.txt" "$DATA_ROOT/val_new_split.txt" "$DATA_ROOT/test_new_split.txt"
+python main.py split-data -- \
+  --data-root "$DATA_ROOT" \
+  --train-split-name train_av_split.txt \
+  --val-split-name val_av_split.txt \
+  --test-split-name test_av_split.txt
+wc -l "$DATA_ROOT/train_av_split.txt" "$DATA_ROOT/val_av_split.txt" "$DATA_ROOT/test_av_split.txt"
 ```
 
 AV 样本需包含：
@@ -155,11 +172,17 @@ $DATA_ROOT/musices_process_failures.csv
 
 ### 4.1 VIAI-A baseline
 
+以下命令默认读取 `train_viai_a_split.txt`、`val_viai_a_split.txt` 和
+`test_viai_a_split.txt`，这些 split 需由 3.2 中带 `--processed-dir processed_viai_a`
+的命令重新生成，确保文件里的样本路径指向 `processed_viai_a/...`。
+
 1 step sanity check：
 
 ```bash
 python main.py train-viai-a -- \
   --data_root "$DATA_ROOT" \
+  --train_split_name train_viai_a_split.txt \
+  --val_split_name val_viai_a_split.txt \
   --batch_size 1 \
   --num_workers 0 \
   --max_train_steps 1 \
@@ -171,6 +194,8 @@ python main.py train-viai-a -- \
 ```bash
 python main.py train-viai-a -- \
   --data_root "$DATA_ROOT" \
+  --train_split_name train_viai_a_split.txt \
+  --val_split_name val_viai_a_split.txt \
   --batch_size 16 \
   --num_workers 4 \
   --checkpoint_interval 1000 \
@@ -183,6 +208,7 @@ python main.py train-viai-a -- \
 ```bash
 python main.py test-viai-a -- \
   --data_root "$DATA_ROOT" \
+  --test_split_name test_viai_a_split.txt \
   --resume_path checkpoints/VIAI-A_checkpoint_step000001000.pth.tar \
   --batch_size 16 \
   --num_workers 4 \
@@ -208,15 +234,18 @@ python main.py train-viai-a -- \
   --use_gan \
   --name VIAI-A-PatchGAN \
   --data_root "$DATA_ROOT" \
+  --train_split_name train_viai_a_split.txt \
+  --val_split_name val_viai_a_split.txt \
   --resume \
-  --resume_path checkpoints/VIAI-A_checkpoint_step000001000.pth.tar \
+  --resume_path checkpoints/VIAI-A_checkpoint_step000006800.pth.tar \
   --reset_optimizer \
   --batch_size 16 \
   --num_workers 4 \
-  --beta_gan 0.1 \
+  --lambda_recon 1.0 \
   --checkpoint_interval 1000 \
   --print_freq 100 \
-  --display_id 0
+  --display_id 0 \
+  --nepochs 120
 ```
 
 测试 PatchGAN checkpoint 时也传 `--use_gan`：
@@ -226,6 +255,7 @@ python main.py test-viai-a -- \
   --use_gan \
   --name VIAI-A-PatchGAN \
   --data_root "$DATA_ROOT" \
+  --test_split_name test_viai_a_split.txt \
   --resume_path checkpoints/VIAI-A-PatchGAN_checkpoint_step000002000.pth.tar \
   --batch_size 16 \
   --num_workers 4 \
@@ -242,7 +272,9 @@ VIAI-AV 默认使用 PatchGAN，并优先从 `VIAI-A-PatchGAN` 初始化音频�
 ```bash
 python main.py train-viai-av -- \
   --data_root "$DATA_ROOT" \
-  --init_from_viai_a checkpoints/VIAI-A-PatchGAN_checkpoint_step000002000.pth.tar \
+  --train_split_name train_av_split.txt \
+  --val_split_name val_av_split.txt \
+  --init_from_viai_a checkpoints/VIAI-A-PatchGAN_checkpoint_step000006800.pth.tar \
   --checkpoint_dir /tmp/viai_av_smoke \
   --log_event_path /tmp/viai_av_smoke/events \
   --batch_size 1 \
@@ -257,10 +289,12 @@ python main.py train-viai-av -- \
 ```bash
 python main.py train-viai-av -- \
   --data_root "$DATA_ROOT" \
-  --init_from_viai_a checkpoints/VIAI-A-PatchGAN_checkpoint_step000002000.pth.tar \
+  --train_split_name train_av_split.txt \
+  --val_split_name val_av_split.txt \
+  --init_from_viai_a checkpoints/VIAI-A-PatchGAN_checkpoint_step000006800.pth.tar \
   --batch_size 16 \
   --num_workers 4 \
-  --beta_gan 0.1 \
+  --lambda_recon 1.0 \
   --checkpoint_interval 1000 \
   --print_freq 100 \
   --display_id 0
@@ -273,6 +307,8 @@ python main.py train-viai-av -- \
   --resume \
   --resume_path checkpoints/VIAI-AV_checkpoint_step000001000.pth.tar \
   --data_root "$DATA_ROOT" \
+  --train_split_name train_av_split.txt \
+  --val_split_name val_av_split.txt \
   --batch_size 16 \
   --num_workers 4 \
   --display_id 0
@@ -284,19 +320,20 @@ python main.py train-viai-av -- \
 python main.py test-viai-av -- \
   --resume_path checkpoints/VIAI-AV_checkpoint_step000001000.pth.tar \
   --data_root "$DATA_ROOT" \
+  --test_split_name test_av_split.txt \
   --batch_size 16 \
   --num_workers 4 \
   --display_id 0 \
   --results_dir checkpoints/viai_av_test_results
 ```
 
-如果本地 `test_new_split.txt` 为空，可以临时用训练 split 验证入口：
+如果本地 `test_av_split.txt` 为空，可以临时用训练 split 验证入口：
 
 ```bash
 python main.py test-viai-av -- \
   --resume_path /tmp/viai_av_smoke/VIAI-AV_checkpoint_step000000001.pth.tar \
   --data_root "$DATA_ROOT" \
-  --test_split_name train_new_split.txt \
+  --test_split_name train_av_split.txt \
   --batch_size 1 \
   --num_workers 0 \
   --display_id 0 \
@@ -319,6 +356,8 @@ checkpoints/viai_av_test_results/mel-image/stepXXXXXXXXX/*.png
 ```bash
 python main.py train-viai-av -- \
   --data_root "$DATA_ROOT" \
+  --train_split_name train_av_split.txt \
+  --val_split_name val_av_split.txt \
   --init_from_viai_a checkpoints/VIAI-A-PatchGAN_checkpoint_step000002000.pth.tar \
   --disable_sync_loss \
   --disable_probe_loss
@@ -332,6 +371,7 @@ python main.py train-viai-av -- \
 python main.py test-viai-av -- \
   --resume_path checkpoints/VIAI-AV_checkpoint_step000001000.pth.tar \
   --data_root "$DATA_ROOT" \
+  --test_split_name test_av_split.txt \
   --batch_size 16 \
   --num_workers 4 \
   --display_id 0 \
@@ -346,7 +386,7 @@ python main.py test-viai-av -- \
 python main.py test-viai-av -- \
   --resume_path /tmp/viai_av_smoke/VIAI-AV_checkpoint_step000000001.pth.tar \
   --data_root "$DATA_ROOT" \
-  --test_split_name train_new_split.txt \
+  --test_split_name train_av_split.txt \
   --batch_size 1 \
   --num_workers 0 \
   --results_dir /tmp/viai_av_smoke_results \
@@ -373,6 +413,7 @@ psnr_full
 psnr_missing
 ssim
 loss_recon / loss_g_gan / loss_sync / loss_probe_gen
+lambda_recon
 retrieval_audio_to_video_r1
 retrieval_video_to_audio_r1
 ```
@@ -390,6 +431,9 @@ tensorboard --logdir checkpoints/events_viai_a --port 6006
 tensorboard --logdir checkpoints/events_viai_a_patchgan --port 6006
 tensorboard --logdir checkpoints/events_viai_av --port 6006
 ```
+
+VIAI-A/VIAI-AV TensorBoard 额外写入 `weighted_loss_recon` 和
+`weighted_loss_gan`，用于查看各 loss 项对总损失的实际贡献。
 
 ## 6. 常见问题
 

@@ -75,17 +75,46 @@ class VIAIAVModel(object):
         self.loss_full_l1_item = 0.0
         self.loss_missing_l1_item = 0.0
         self.loss_G_GAN_item = 0.0
+        self.weighted_loss_recon_item = 0.0
+        self.weighted_loss_gan_item = 0.0
         self.loss_sync_item = 0.0
         self.loss_probe_gen_item = 0.0
         self.loss_probe_recon_item = 0.0
         self.loss_probe_full_l1_item = 0.0
         self.loss_probe_missing_l1_item = 0.0
         self.loss_probe_G_GAN_item = 0.0
+        self.weighted_loss_probe_gen_item = 0.0
         self.loss_D_item = 0.0
         self.loss_D_real_item = 0.0
         self.loss_D_fake_item = 0.0
         self.eta1_item = 0.0
         self.eta2_item = 0.0
+        self._print_loss_configuration()
+
+    def _print_loss_configuration(self):
+        lambda_gan = getattr(self.hparams, "lambda_gan", 1.0)
+        lambda_recon = getattr(self.hparams, "lambda_recon", 1.0)
+        lambda_sync = getattr(self.hparams, "lambda_sync", 1.0)
+        lambda_probe = getattr(self.hparams, "lambda_probe", 1.0)
+        print(
+            "[VIAI-AV] loss weights: "
+            f"lambda_gan={lambda_gan} "
+            f"lambda_recon={lambda_recon} "
+            f"lambda_sync={lambda_sync} "
+            f"lambda_probe={lambda_probe} "
+            f"enable_sync_loss={self.enable_sync_loss} "
+            f"enable_probe_loss={self.enable_probe_loss}"
+        )
+        print(
+            "[VIAI-AV] generator formula: "
+            "loss_av_gen = lambda_gan * loss_g_gan + lambda_recon * loss_recon"
+        )
+        if self.enable_sync_loss or self.enable_probe_loss:
+            print(
+                "[VIAI-AV] total formula: "
+                "loss_total = loss_av_gen + lambda_sync * loss_sync "
+                "+ lambda_probe * eta2 * loss_probe_gen"
+            )
 
     def _eta(self, step, base, interval, floor):
         if interval <= 0:
@@ -191,8 +220,11 @@ class VIAIAVModel(object):
 
         pred_fake = self.netD(self.mel_pred)
         self.loss_G_GAN = self.criterion_gan(pred_fake, True)
-        beta_gan = getattr(self.hparams, "beta_gan", 0.1)
-        self.loss_av_gen = self.loss_G_GAN + beta_gan * self.loss_recon
+        lambda_gan = getattr(self.hparams, "lambda_gan", 1.0)
+        lambda_recon = getattr(self.hparams, "lambda_recon", 1.0)
+        self.weighted_loss_recon = lambda_recon * self.loss_recon
+        self.weighted_loss_gan = lambda_gan * self.loss_G_GAN
+        self.loss_av_gen = self.weighted_loss_gan + self.weighted_loss_recon
 
         if self.enable_sync_loss:
             self.loss_sync = self.criterion_sync(self.mel_net_norm, self.video_net_norm)
@@ -207,7 +239,10 @@ class VIAIAVModel(object):
             ) = self._reconstruction_losses(self.mel_probe_pred)
             pred_probe_fake = self.netD(self.mel_probe_pred)
             self.loss_probe_G_GAN = self.criterion_gan(pred_probe_fake, True)
-            self.loss_probe_gen = self.loss_probe_G_GAN + beta_gan * self.loss_probe_recon
+            self.loss_probe_gen = (
+                lambda_gan * self.loss_probe_G_GAN
+                + lambda_recon * self.loss_probe_recon
+            )
         else:
             self.loss_probe_recon = self._zero_loss_like(self.loss_av_gen)
             self.loss_probe_full_l1 = self._zero_loss_like(self.loss_av_gen)
@@ -217,10 +252,11 @@ class VIAIAVModel(object):
 
         lambda_sync = getattr(self.hparams, "lambda_sync", 1.0)
         lambda_probe = getattr(self.hparams, "lambda_probe", 1.0)
+        self.weighted_loss_probe_gen = self.eta2 * self.loss_probe_gen
         self.loss_total = (
             self.loss_av_gen
             + lambda_sync * self.loss_sync
-            + lambda_probe * self.eta2 * self.loss_probe_gen
+            + lambda_probe * self.weighted_loss_probe_gen
         )
 
     def _compute_discriminator_loss(self):
@@ -252,14 +288,14 @@ class VIAIAVModel(object):
         self.optimizer_D.step()
         self.current_lr = self.optimizer_G.param_groups[0]["lr"]
 
-    def test(self):
+    def test(self, global_step=0):
         self.Mel_Encoder.eval()
         self.VideoEncoder.eval()
         self.Mel_Decoder.eval()
         self.netD.eval()
         with torch.no_grad():
             self._forward_inpainter()
-            self._compute_losses(global_step=0)
+            self._compute_losses(global_step=global_step)
             self._compute_discriminator_loss()
 
     def get_loss_items(self):
@@ -269,12 +305,17 @@ class VIAIAVModel(object):
         self.loss_full_l1_item = float(self.loss_full_l1.detach().cpu().item())
         self.loss_missing_l1_item = float(self.loss_missing_l1.detach().cpu().item())
         self.loss_G_GAN_item = float(self.loss_G_GAN.detach().cpu().item())
+        self.weighted_loss_recon_item = float(self.weighted_loss_recon.detach().cpu().item())
+        self.weighted_loss_gan_item = float(self.weighted_loss_gan.detach().cpu().item())
         self.loss_sync_item = float(self.loss_sync.detach().cpu().item())
         self.loss_probe_gen_item = float(self.loss_probe_gen.detach().cpu().item())
         self.loss_probe_recon_item = float(self.loss_probe_recon.detach().cpu().item())
         self.loss_probe_full_l1_item = float(self.loss_probe_full_l1.detach().cpu().item())
         self.loss_probe_missing_l1_item = float(self.loss_probe_missing_l1.detach().cpu().item())
         self.loss_probe_G_GAN_item = float(self.loss_probe_G_GAN.detach().cpu().item())
+        self.weighted_loss_probe_gen_item = float(
+            self.weighted_loss_probe_gen.detach().cpu().item()
+        )
         self.loss_D_item = float(self.loss_D.detach().cpu().item())
         self.loss_D_real_item = float(self.loss_D_real.detach().cpu().item())
         self.loss_D_fake_item = float(self.loss_D_fake.detach().cpu().item())
@@ -290,12 +331,20 @@ class VIAIAVModel(object):
         writer.add_scalar(f"{prefix}/loss_full_l1", self.loss_full_l1_item, step)
         writer.add_scalar(f"{prefix}/loss_missing_l1", self.loss_missing_l1_item, step)
         writer.add_scalar(f"{prefix}/loss_g_gan", self.loss_G_GAN_item, step)
+        writer.add_scalar(f"{prefix}/weighted_loss_recon", self.weighted_loss_recon_item, step)
+        writer.add_scalar(f"{prefix}/weighted_loss_gan", self.weighted_loss_gan_item, step)
         writer.add_scalar(f"{prefix}/loss_sync", self.loss_sync_item, step)
         writer.add_scalar(f"{prefix}/loss_probe_gen", self.loss_probe_gen_item, step)
         writer.add_scalar(f"{prefix}/loss_probe_recon", self.loss_probe_recon_item, step)
         writer.add_scalar(f"{prefix}/loss_probe_full_l1", self.loss_probe_full_l1_item, step)
         writer.add_scalar(f"{prefix}/loss_probe_missing_l1", self.loss_probe_missing_l1_item, step)
         writer.add_scalar(f"{prefix}/loss_probe_g_gan", self.loss_probe_G_GAN_item, step)
+        if self.enable_probe_loss:
+            writer.add_scalar(
+                f"{prefix}/weighted_loss_probe_gen",
+                self.weighted_loss_probe_gen_item,
+                step,
+            )
         writer.add_scalar(f"{prefix}/loss_d", self.loss_D_item, step)
         writer.add_scalar(f"{prefix}/loss_d_real", self.loss_D_real_item, step)
         writer.add_scalar(f"{prefix}/loss_d_fake", self.loss_D_fake_item, step)

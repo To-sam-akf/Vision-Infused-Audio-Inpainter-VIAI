@@ -33,6 +33,26 @@ def configure_viai_av_defaults():
         hparams.log_event_path = os.path.join(hparams.checkpoint_dir, "events_viai_av")
 
 
+def print_viai_av_run_config():
+    print(
+        "[VIAI-AV] run config: "
+        f"lambda_recon={getattr(hparams, 'lambda_recon', 1.0)} "
+        f"lambda_gan={getattr(hparams, 'lambda_gan', 1.0)} "
+        f"lambda_sync={getattr(hparams, 'lambda_sync', 1.0)} "
+        f"lambda_probe={getattr(hparams, 'lambda_probe', 1.0)} "
+        f"disable_sync_loss={getattr(hparams, 'disable_sync_loss', False)} "
+        f"disable_probe_loss={getattr(hparams, 'disable_probe_loss', False)}"
+    )
+    print(
+        "[VIAI-AV] paths: "
+        f"checkpoint_dir={hparams.checkpoint_dir} "
+        f"log_event_path={hparams.log_event_path} "
+        f"init_from_viai_a={hparams.init_from_viai_a} "
+        f"resume={hparams.resume} "
+        f"resume_path={hparams.resume_path}"
+    )
+
+
 def checkpoint_step(path):
     match = re.search(r"checkpoint_step(\d+)", os.path.basename(str(path)))
     return int(match.group(1)) if match else -1
@@ -174,7 +194,7 @@ def run_phase(model, data_loader, phase, global_step, writer, global_epoch):
             model.optimize_parameters(global_step)
             global_step += 1
         else:
-            model.test()
+            model.test(global_step=global_step)
         model.get_loss_items()
         metrics = compute_viai_a_metrics(
             model.mel_pred,
@@ -239,6 +259,8 @@ def run_phase(model, data_loader, phase, global_step, writer, global_epoch):
                 f"probe_full_l1={model.loss_probe_full_l1_item:.6f} "
                 f"probe_missing_l1={model.loss_probe_missing_l1_item:.6f} "
                 f"g_gan={model.loss_G_GAN_item:.6f} "
+                f"weighted_gan={model.weighted_loss_gan_item:.6f} "
+                f"weighted_recon={model.weighted_loss_recon_item:.6f} "
                 f"probe_g_gan={model.loss_probe_G_GAN_item:.6f} "
                 f"d={model.loss_D_item:.6f} "
                 f"eta1={model.eta1_item:.6f} "
@@ -349,6 +371,7 @@ def train_loop(model, data_loaders, writer, start_step=0, start_epoch=0):
 def main():
     configure_viai_av_defaults()
     os.makedirs(hparams.checkpoint_dir, exist_ok=True)
+    print_viai_av_run_config()
     data_loaders = av_loader.get_data_loaders(hparams.data_root, hparams.speaker_id, phases=("train", "val"))
     model = VIAIAVModel(hparams, device=device)
 

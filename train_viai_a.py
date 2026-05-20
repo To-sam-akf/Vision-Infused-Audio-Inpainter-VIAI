@@ -105,7 +105,7 @@ def run_phase(model, data_loader, phase, global_step, writer, global_epoch):
             model.optimize_parameters(global_step)
             global_step += 1
         else:
-            model.test()
+            model.test(global_step=global_step)
         model.get_loss_items()
         metrics = compute_viai_a_metrics(
             model.mel_pred,
