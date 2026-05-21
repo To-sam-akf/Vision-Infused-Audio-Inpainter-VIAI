@@ -22,6 +22,7 @@ class VIAIAModel(object):
         self.netD = None
         self.criterion_gan = None
         self.optimizer_D = None
+        # 使用PatchGAN判别器
         if self.use_gan:
             self.netD = Discriminator_Networks.MelDiscriminator().to(self.device)
             self.criterion_gan = GANLoss(use_lsgan=False, device=self.device)
@@ -50,6 +51,7 @@ class VIAIAModel(object):
         self.loss_D_item = 0.0
         self.loss_D_real_item = 0.0
         self.loss_D_fake_item = 0.0
+        self.beta_recon_item = float(getattr(hparams, "beta_recon", getattr(hparams, "lambda_recon", 1.0)))
         self.eta1_item = 0.0
 
     def _eta(self, step, base, interval, floor):
@@ -94,11 +96,19 @@ class VIAIAModel(object):
         self.loss_recon = self.eta1 * self.loss_full_l1 + self.loss_missing_l1
         if self.use_gan:
             pred_fake = self.netD(self.mel_pred)
+            # 计算生成器的 GAN 损失，鼓励生成的谱图被判别器认为是真实的。
             self.loss_G_GAN = self.criterion_gan(pred_fake, True)
-            lambda_recon = getattr(self.hparams, "lambda_recon", 1.0)
-            self.weighted_loss_recon = lambda_recon * self.loss_recon
+            beta_recon = getattr(
+                self.hparams,
+                "beta_recon",
+                getattr(self.hparams, "lambda_recon", 1.0),
+            )
+            self.weighted_loss_recon = beta_recon * self.loss_recon
             self.weighted_loss_gan = self.loss_G_GAN
+            self.beta_recon_item = float(beta_recon)
+            # Paper Eq. (3): loss_total = loss_G_GAN + beta * loss_recon.
             self.loss_total = self.weighted_loss_gan + self.weighted_loss_recon
+        # 不适用patchGAN时，GAN loss 直接为0，不参与总损失计算。
         else:
             self.weighted_loss_recon = self.loss_recon
             self.weighted_loss_gan = torch.zeros(
@@ -109,6 +119,7 @@ class VIAIAModel(object):
     def _compute_discriminator_loss(self):
         if not self.use_gan:
             return
+        # 计算判别器损失：对真实样本和生成样本分别计算损失，并取平均。
         pred_real = self.netD(self.mel_target_4d)
         pred_fake = self.netD(self.mel_pred.detach())
         self.loss_D_real = self.criterion_gan(pred_real, True, softlabel=True)
@@ -152,6 +163,9 @@ class VIAIAModel(object):
         self.loss_missing_l1_item = float(self.loss_missing_l1.detach().cpu().item())
         self.weighted_loss_recon_item = float(self.weighted_loss_recon.detach().cpu().item())
         self.weighted_loss_gan_item = float(self.weighted_loss_gan.detach().cpu().item())
+        self.beta_recon_item = float(
+            getattr(self.hparams, "beta_recon", getattr(self.hparams, "lambda_recon", 1.0))
+        )
         self.eta1_item = float(self.eta1)
         if self.use_gan:
             self.loss_G_GAN_item = float(self.loss_G_GAN.detach().cpu().item())
@@ -187,6 +201,7 @@ class VIAIAModel(object):
             writer.add_scalar(f"{prefix}/loss_g_gan", self.loss_G_GAN_item, step)
             writer.add_scalar(f"{prefix}/weighted_loss_recon", self.weighted_loss_recon_item, step)
             writer.add_scalar(f"{prefix}/weighted_loss_gan", self.weighted_loss_gan_item, step)
+            writer.add_scalar(f"{prefix}/beta_recon", self.beta_recon_item, step)
             writer.add_scalar(f"{prefix}/loss_d", self.loss_D_item, step)
             writer.add_scalar(f"{prefix}/loss_d_real", self.loss_D_real_item, step)
             writer.add_scalar(f"{prefix}/loss_d_fake", self.loss_D_fake_item, step)

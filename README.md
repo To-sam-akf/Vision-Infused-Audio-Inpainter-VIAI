@@ -241,7 +241,7 @@ python main.py train-viai-a -- \
   --reset_optimizer \
   --batch_size 16 \
   --num_workers 4 \
-  --lambda_recon 1.0 \
+  --beta_recon 1.0 \
   --checkpoint_interval 1000 \
   --print_freq 100 \
   --display_id 0 \

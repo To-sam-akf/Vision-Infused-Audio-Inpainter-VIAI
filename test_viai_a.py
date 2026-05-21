@@ -11,7 +11,11 @@ from tqdm import tqdm
 import Options_inpainting
 from Data_loaders import viai_a_loader
 from Models.VIAI_A_inpainting import VIAIAModel
-from utils.viai_a_metrics import compute_viai_a_metrics, save_mel_comparison_batch
+from utils.viai_a_metrics import (
+    compose_inpainted_mel,
+    compute_viai_a_metrics,
+    save_mel_comparison_batch,
+)
 from utils.vocoder import save_vocoder_batch
 
 
@@ -204,8 +208,13 @@ def mel_image_output_dir(results_dir, checkpoint_step_value):
 
 
 def batch_metrics(model):
-    metrics = compute_viai_a_metrics(
+    mel_completed = compose_inpainted_mel(
+        model.mel_input_4d,
         model.mel_pred,
+        model.missing_mask,
+    )
+    metrics = compute_viai_a_metrics(
+        mel_completed,
         model.mel_target_4d,
         model.missing_mask,
         compute_ssim=True,

@@ -13,7 +13,11 @@ import Options_inpainting
 from Data_loaders import audio_loader as av_loader
 from Models.VIAI_AV_inpainting import VIAIAVModel
 from utils import util
-from utils.viai_a_metrics import compute_viai_a_metrics, save_mel_comparison_batch
+from utils.viai_a_metrics import (
+    compose_inpainted_mel,
+    compute_viai_a_metrics,
+    save_mel_comparison_batch,
+)
 from utils.vocoder import save_vocoder_batch
 
 
@@ -121,8 +125,13 @@ def format_step(step):
 
 
 def batch_metrics(model):
-    metrics = compute_viai_a_metrics(
+    mel_completed = compose_inpainted_mel(
+        model.mel_input_4d,
         model.mel_pred,
+        model.missing_mask,
+    )
+    metrics = compute_viai_a_metrics(
+        mel_completed,
         model.mel_target_4d,
         model.missing_mask,
         compute_ssim=True,
@@ -220,6 +229,7 @@ def evaluate(model, data_loader, global_step=0, image_dir=None, vocoder_dir=None
                 model.mel_input_4d,
                 model.mel_pred,
                 model.mel_target_4d,
+                model.missing_mask,
             )
         if vocoder_dir is not None:
             remaining = None

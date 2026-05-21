@@ -68,6 +68,7 @@ def process_record(record, args, ffmpeg_binary):
 
     prepare_musices.ensure_dir(sample_dir)
     wav_path = sample_dir / "source.wav"
+    # 从视频里抽音频，默认抽取 trim_start_sec 之后的剩余整段
     prepare_musices.extract_audio_from_video(
         video_path,
         wav_path,

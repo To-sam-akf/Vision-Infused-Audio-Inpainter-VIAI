@@ -142,3 +142,155 @@ train/weighted_loss_gan = loss_g_gan
 ```
 
 这样之后可以直接看到各 loss 项对总损失的实际贡献。
+
+
+### 2026-5-20 17:46:    VIAI-A+PatchGan loss 方向异常排查
+
+#### 背景
+
+本次对比的是两组训练曲线：
+
+![](./img/viai-a+patch/viai-aPatchgan+lossfull.jpeg)
+![](./img/viai-a/viai-a+lossfull.jpeg)
+1. `VIAI-A` audio-only baseline，训练 100 epoch，末尾约 6800 step。
+2. `VIAI-A + PatchGAN`，从 `VIAI-A` 第 100 epoch checkpoint 接续训练到 120 epoch，约等于额外训练 20 epoch。
+
+现象：
+
+1. 加入 PatchGAN 后，`train/loss_full_l1` 和 `train/loss_missing_l1` 不再下降，反而明显变差。
+2. `train/psnr_full`、`train/ssim_full` 相比纯 `VIAI-A` 明显降低。
+3. `train/loss_g_gan` 上升，`train/loss_d` 下降，说明判别器逐渐变强，生成器越来越难骗过判别器。
+4. PatchGAN 阶段的 `train/loss_recon`/`train/loss_total` 曲线看起来像从 0 附近骤升。
+
+#### 已确认实现
+
+`VIAI-A + PatchGAN` 没有单独的新生成器。生成器仍然是：
+
+```text
+MelEncoder + MelDecoder
+```
+
+PatchGAN 部分只新增 Mel 判别器 `MelDiscriminator` 和对应 GAN loss。生成器训练目标为论文第 3 页公式：
+
+```text
+L_total = L_GAN + beta * L_re
+L_re = eta1(t) * full_l1 + missing_l1
+```
+
+当前代码已将 `Models/VIAI_A_inpainting.py` 中的 PatchGAN generator loss 显式整理为：
+
+```python
+self.weighted_loss_recon = beta_recon * self.loss_recon
+self.weighted_loss_gan = self.loss_G_GAN
+self.loss_total = self.weighted_loss_gan + self.weighted_loss_recon
+```
+
+并在 `base_options.py` 中新增 `--beta_recon`，同时保留 `--lambda_recon` 作为兼容旧命令的 reconstruction 权重别名。
+
+#### 对曲线的解释
+
+从 `VIAI-A` checkpoint 接续训练本身不是错误，但它会造成一个很明显的训练目标切换：
+
+```text
+前 100 epoch:
+只优化 L_recon
+
+接续 PatchGAN:
+优化 L_GAN + beta * L_recon
+```
+
+此时判别器 `netD` 是新加入的，或者至少处于与已有生成器不平衡的状态。生成器原本已经收敛到较好的 L1 重建位置，突然加入 GAN 梯度后，优化方向会被对抗项拉走，因此 `loss_full_l1`、`loss_missing_l1` 变差是合理现象。
+
+`loss` 从 0 附近骤升不一定表示 checkpoint 加载坏了，主要有两个原因：
+
+1. `loss_recon`/`loss_g_gan` 这类 tag 在纯 `VIAI-A` 阶段可能没有写入，开启 PatchGAN 后才开始出现，TensorBoard 会显示为突然出现。
+2. PatchGAN 后的 `loss_total` 多了 `loss_g_gan`，而 GAN loss 初始常在 `0.6~0.9` 左右，数值尺度明显大于 L1 reconstruction loss。
+
+#### 初步结论
+
+当前曲线说明：在本次设置下，PatchGAN 对 Mel 频谱图的逐点重建指标是负收益。
+
+更具体地说，它不一定证明 PatchGAN 理论上无效，但说明当前权重/训练节奏下，判别器约束过强，生成器为了骗过判别器牺牲了 `full_l1`、`missing_l1`、PSNR 和 SSIM。
+
+#### 排查与验证方案
+
+优先验证 reconstruction 权重是否过小。建议从同一个 `VIAI-A` 100 epoch checkpoint 开始，做短跑对照实验。
+
+实验 A：提高 reconstruction 权重到 10。
+
+```bash
+python main.py train-viai-a -- \
+  --use_gan \
+  --name VIAI-A-PatchGAN-beta10 \
+  --data_root "$DATA_ROOT" \
+  --train_split_name train_viai_a_split.txt \
+  --val_split_name val_viai_a_split.txt \
+  --resume \
+  --resume_path checkpoints/VIAI-A_checkpoint_step000006800.pth.tar \
+  --reset_optimizer \
+  --batch_size 16 \
+  --num_workers 4 \
+  --beta_recon 10.0 \
+  --checkpoint_interval 1000 \
+  --print_freq 100 \
+  --display_id 0 \
+  --log_event_path checkpoints/events_viai_a_patchgan_beta10
+```
+
+实验 B：进一步提高 reconstruction 权重到 50。
+
+```bash
+python main.py train-viai-a -- \
+  --use_gan \
+  --name VIAI-A-PatchGAN-beta50 \
+  --data_root "$DATA_ROOT" \
+  --train_split_name train_viai_a_split.txt \
+  --val_split_name val_viai_a_split.txt \
+  --resume \
+  --resume_path checkpoints/VIAI-A_checkpoint_step000006800.pth.tar \
+  --reset_optimizer \
+  --batch_size 16 \
+  --num_workers 4 \
+  --beta_recon 50.0 \
+  --checkpoint_interval 1000 \
+  --print_freq 100 \
+  --display_id 0 \
+  --log_event_path checkpoints/events_viai_a_patchgan_beta50
+```
+
+实验 C：如果 beta=50 仍不能稳定 L1，再尝试 beta=100。
+
+```bash
+python main.py train-viai-a -- \
+  --use_gan \
+  --name VIAI-A-PatchGAN-beta100 \
+  --data_root "$DATA_ROOT" \
+  --train_split_name train_viai_a_split.txt \
+  --val_split_name val_viai_a_split.txt \
+  --resume \
+  --resume_path checkpoints/VIAI-A_checkpoint_step000006800.pth.tar \
+  --reset_optimizer \
+  --batch_size 16 \
+  --num_workers 4 \
+  --beta_recon 100.0 \
+  --checkpoint_interval 1000 \
+  --print_freq 100 \
+  --display_id 0 \
+  --log_event_path checkpoints/events_viai_a_patchgan_beta100
+```
+
+#### 判断标准
+
+1. 若提高 `--beta_recon` 后，`train/loss_full_l1`、`train/loss_missing_l1` 不再持续上升，说明主因是 GAN 项相对 reconstruction 项过强。
+2. 若 `val/loss_missing_l1`、`val/psnr_missing` 同步改善，说明问题不是单纯训练集波动，而是 loss 权重导致的优化方向偏移。
+3. 若 `loss_d` 继续快速下降且 `loss_g_gan` 继续上升，同时 L1 仍变差，说明判别器仍然过强，需要考虑降低判别器学习率、降低判别器更新频率，或冻结生成器/判别器做更平滑的 warm-up。
+4. 最终以 `test/mel_l1_missing`、`test/psnr_missing`、Mel 对比图和 vocoder 导出的音频为准。`psnr_full`/`ssim_full` 可作为参考，但实际修复更关注缺失区域。
+
+#### 后续可选改动
+
+若单纯增大 `--beta_recon` 仍不稳定，可以继续做以下改动：
+
+1. 为判别器单独增加学习率参数，例如 `--lr_d`，令 `lr_d < lr_g`。
+2. 增加判别器更新间隔，例如每 2 到 5 个 generator step 更新一次 `netD`。
+3. PatchGAN 前若从纯 `VIAI-A` checkpoint 热启动，可以先用较大的 `--beta_recon` 训练若干 step，再逐步降低 beta，让 GAN 影响缓慢进入。
+4. TensorBoard 重点观察 `weighted_loss_recon`、`weighted_loss_gan`、`loss_d`、`loss_g_gan`、`loss_missing_l1` 和 `psnr_missing`，避免只看 `loss_total`。

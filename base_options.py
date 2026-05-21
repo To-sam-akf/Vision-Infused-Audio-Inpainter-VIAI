@@ -119,7 +119,18 @@ class BaseOptions(object):
             help="For VIAI-A stage 2, enable PatchGAN discriminator and GAN loss.",
         )
         self.parser.add_argument("--lambda_gan", type=float, default=1.0)
-        self.parser.add_argument("--lambda_recon", type=float, default=1.0)
+        self.parser.add_argument(
+            "--lambda_recon",
+            type=float,
+            default=1.0,
+            help="Backward-compatible name for the VIAI reconstruction weight beta.",
+        )
+        self.parser.add_argument(
+            "--beta_recon",
+            type=float,
+            default=None,
+            help="Paper-style beta weight for reconstruction loss in L_GAN + beta * L_re.",
+        )
         self.parser.add_argument("--lambda_sync", type=float, default=1.0)
         self.parser.add_argument("--lambda_probe", type=float, default=1.0)
         self.parser.add_argument("--sync_margin", type=float, default=1.0)
@@ -252,6 +263,11 @@ class BaseOptions(object):
 
     def parse(self, args=None):
         opt = self.gather_options(args=args)
+
+        if opt.beta_recon is None:
+            opt.beta_recon = opt.lambda_recon
+        else:
+            opt.lambda_recon = opt.beta_recon
 
         if opt.length_feature != opt.feature_length:
             opt.length_feature = opt.feature_length

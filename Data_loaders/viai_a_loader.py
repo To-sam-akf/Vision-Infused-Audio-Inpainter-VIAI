@@ -72,6 +72,7 @@ class VIAIASplitDataset(data_utils.Dataset):
         self.train = train
         self.hparams = hparams
         self.rows = read_split_rows(data_root, split_name)
+        # 4 秒裁剪发生在训练数据读取阶段
         self.mel_window = int(hparams.max_mel_lengths)
         self.audio_window = self.mel_window * int(hparams.hop_size)
 

@@ -13,6 +13,14 @@ def _as_bchw(tensor):
     raise ValueError("Expected a 3D (B, C, T) or 4D (B, 1, C, T) tensor.")
 
 
+def compose_inpainted_mel(mel_input, mel_pred, missing_mask):
+    """Return the final inpainted Mel: keep known bins, replace only the gap."""
+    mel_input = _as_bchw(mel_input)
+    mel_pred = _as_bchw(mel_pred)
+    mask = _as_bchw(missing_mask).to(device=mel_pred.device, dtype=mel_pred.dtype)
+    return mel_input * (1.0 - mask) + mel_pred * mask
+
+
 def structural_similarity_2d(pred, target):
     try:
         from skimage.metrics import structural_similarity
@@ -153,9 +161,15 @@ def save_mel_comparison_batch(
     mel_target = torch.clamp(_as_bchw(mel_target).detach().cpu(), 0.0, 1.0)
     if missing_mask is None:
         mel_masked = mel_input
+        mel_display_pred = mel_pred
     else:
         mask = _as_bchw(missing_mask).detach().cpu().to(dtype=mel_target.dtype)
         mel_masked = torch.clamp(mel_target * (1.0 - mask), 0.0, 1.0)
+        mel_display_pred = torch.clamp(
+            compose_inpainted_mel(mel_input, mel_pred, mask),
+            0.0,
+            1.0,
+        )
 
     written_paths = []
     for index in range(mel_target.size(0)):
@@ -169,7 +183,7 @@ def save_mel_comparison_batch(
             output_path,
             mel_masked[index, 0],
             mel_input[index, 0],
-            mel_pred[index, 0],
+            mel_display_pred[index, 0],
             mel_target[index, 0],
         )
         written_paths.append(output_path)
