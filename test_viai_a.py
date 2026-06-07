@@ -38,6 +38,10 @@ RESULT_FIELDS = [
     "loss_recon",
     "loss_g_gan",
     "loss_d",
+    "loss_d_real",
+    "loss_d_fake",
+    "d_real_mean",
+    "d_fake_mean",
     "eta1",
     "lambda_recon",
     "mel_l1_full",
@@ -116,6 +120,10 @@ def build_result_record(checkpoint_path, checkpoint_step_value, global_step, glo
         "loss_recon": float(results["loss_recon"]),
         "loss_g_gan": float(results["loss_g_gan"]),
         "loss_d": float(results["loss_d"]),
+        "loss_d_real": float(results["loss_d_real"]),
+        "loss_d_fake": float(results["loss_d_fake"]),
+        "d_real_mean": float(results["d_real_mean"]),
+        "d_fake_mean": float(results["d_fake_mean"]),
         "eta1": float(results["eta1"]),
         "lambda_recon": float(getattr(hparams, "lambda_recon", 1.0)),
         "mel_l1_full": float(results["mel_l1_full"]),
@@ -146,6 +154,10 @@ def coerce_csv_record(row):
         "loss_recon",
         "loss_g_gan",
         "loss_d",
+        "loss_d_real",
+        "loss_d_fake",
+        "d_real_mean",
+        "d_fake_mean",
         "eta1",
         "lambda_recon",
         "mel_l1_full",
@@ -233,6 +245,10 @@ def evaluate(model, data_loader, global_step=0, image_dir=None, vocoder_dir=None
         "loss_recon": 0.0,
         "loss_g_gan": 0.0,
         "loss_d": 0.0,
+        "loss_d_real": 0.0,
+        "loss_d_fake": 0.0,
+        "d_real_mean": 0.0,
+        "d_fake_mean": 0.0,
         "eta1": 0.0,
         "full_l1": 0.0,
         "missing_l1": 0.0,
@@ -252,8 +268,7 @@ def evaluate(model, data_loader, global_step=0, image_dir=None, vocoder_dir=None
         dynamic_ncols=True,
     )
     for data in progress:
-        model.get_blank_space_length(0)
-        model.set_inputs(data)
+        model.set_inputs(data, deterministic_missing=True)
         model.test(global_step=global_step)
         model.get_loss_items()
         metrics = batch_metrics(model)
@@ -263,6 +278,10 @@ def evaluate(model, data_loader, global_step=0, image_dir=None, vocoder_dir=None
         totals["loss_recon"] += model.loss_recon_item
         totals["loss_g_gan"] += model.loss_G_GAN_item
         totals["loss_d"] += model.loss_D_item
+        totals["loss_d_real"] += model.loss_D_real_item
+        totals["loss_d_fake"] += model.loss_D_fake_item
+        totals["d_real_mean"] += model.d_real_mean_item
+        totals["d_fake_mean"] += model.d_fake_mean_item
         totals["eta1"] += model.eta1_item
         totals["full_l1"] += model.loss_full_l1_item
         totals["missing_l1"] += model.loss_missing_l1_item
@@ -312,6 +331,8 @@ def evaluate(model, data_loader, global_step=0, image_dir=None, vocoder_dir=None
         if model.use_gan:
             postfix["g_gan"] = f"{model.loss_G_GAN_item:.4f}"
             postfix["d"] = f"{model.loss_D_item:.4f}"
+            postfix["d_real"] = f"{model.d_real_mean_item:.3f}"
+            postfix["d_fake"] = f"{model.d_fake_mean_item:.3f}"
         progress.set_postfix(**postfix)
 
     if batch_count == 0:
@@ -322,6 +343,10 @@ def evaluate(model, data_loader, global_step=0, image_dir=None, vocoder_dir=None
         "loss_recon": totals["loss_recon"] / batch_count,
         "loss_g_gan": totals["loss_g_gan"] / batch_count,
         "loss_d": totals["loss_d"] / batch_count,
+        "loss_d_real": totals["loss_d_real"] / batch_count,
+        "loss_d_fake": totals["loss_d_fake"] / batch_count,
+        "d_real_mean": totals["d_real_mean"] / batch_count,
+        "d_fake_mean": totals["d_fake_mean"] / batch_count,
         "eta1": totals["eta1"] / batch_count,
         "mel_l1_full": totals["full_l1"] / batch_count,
         "mel_l1_missing": totals["missing_l1"] / batch_count,
@@ -386,6 +411,10 @@ def main():
         f"recon={results['loss_recon']:.6f} "
         f"g_gan={results['loss_g_gan']:.6f} "
         f"d={results['loss_d']:.6f} "
+        f"d_real={results['loss_d_real']:.6f} "
+        f"d_fake={results['loss_d_fake']:.6f} "
+        f"d_real_mean={results['d_real_mean']:.4f} "
+        f"d_fake_mean={results['d_fake_mean']:.4f} "
         f"eta1={results['eta1']:.6f} "
         f"mel_l1_full={results['mel_l1_full']:.6f} "
         f"mel_l1_missing={results['mel_l1_missing']:.6f} "

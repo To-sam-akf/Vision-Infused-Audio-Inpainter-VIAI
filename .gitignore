@@ -11,10 +11,14 @@ __pycache__/
 .pth
 
 # Video data
-data/raw_videos/
+data/
 
 # Python virtual environment
 venv/
 .venv/
 
 checkpoints/
+
+thought/
+
+logmd/

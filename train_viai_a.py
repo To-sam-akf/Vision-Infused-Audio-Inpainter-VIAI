@@ -68,6 +68,31 @@ def _write_train_monitoring(writer, prefix, step, model, metrics):
     writer.add_scalar(f"{prefix}/lr", model.current_lr, step)
 
 
+def _write_phase_averages(writer, prefix, step, averages, current_lr):
+    if writer is None or averages is None:
+        return
+    writer.add_scalar(f"{prefix}/loss_total", averages["loss_total"], step)
+    writer.add_scalar(f"{prefix}/loss_full_l1", averages["loss_full_l1"], step)
+    writer.add_scalar(f"{prefix}/loss_missing_l1", averages["loss_missing_l1"], step)
+    writer.add_scalar(f"{prefix}/psnr_full", averages["psnr_full"], step)
+    writer.add_scalar(f"{prefix}/psnr_missing", averages["psnr_missing"], step)
+    if averages["ssim_full"] is not None:
+        writer.add_scalar(f"{prefix}/ssim_full", averages["ssim_full"], step)
+    writer.add_scalar(f"{prefix}/blank_frames", averages["blank_frames"], step)
+    writer.add_scalar(f"{prefix}/lr", current_lr, step)
+    if "loss_recon" in averages:
+        writer.add_scalar(f"{prefix}/loss_recon", averages["loss_recon"], step)
+        writer.add_scalar(f"{prefix}/loss_g_gan", averages["loss_g_gan"], step)
+        writer.add_scalar(f"{prefix}/weighted_loss_recon", averages["weighted_loss_recon"], step)
+        writer.add_scalar(f"{prefix}/weighted_loss_gan", averages["weighted_loss_gan"], step)
+        writer.add_scalar(f"{prefix}/beta_recon", averages["beta_recon"], step)
+        writer.add_scalar(f"{prefix}/loss_d", averages["loss_d"], step)
+        writer.add_scalar(f"{prefix}/loss_d_real", averages["loss_d_real"], step)
+        writer.add_scalar(f"{prefix}/loss_d_fake", averages["loss_d_fake"], step)
+        writer.add_scalar(f"{prefix}/d_real_mean", averages["d_real_mean"], step)
+        writer.add_scalar(f"{prefix}/d_fake_mean", averages["d_fake_mean"], step)
+
+
 def run_phase(model, data_loader, phase, global_step, writer, global_epoch):
     train = phase == "train"
     totals = {
@@ -83,7 +108,14 @@ def run_phase(model, data_loader, phase, global_step, writer, global_epoch):
             {
                 "loss_recon": 0.0,
                 "loss_g_gan": 0.0,
+                "weighted_loss_recon": 0.0,
+                "weighted_loss_gan": 0.0,
+                "beta_recon": 0.0,
                 "loss_d": 0.0,
+                "loss_d_real": 0.0,
+                "loss_d_fake": 0.0,
+                "d_real_mean": 0.0,
+                "d_fake_mean": 0.0,
             }
         )
     sample_count = 0
@@ -99,8 +131,9 @@ def run_phase(model, data_loader, phase, global_step, writer, global_epoch):
     )
     for data in progress:
         iter_start_time = time.time()
-        model.get_blank_space_length(global_step)
-        model.set_inputs(data)
+        if train:
+            model.get_blank_space_length(global_step)
+        model.set_inputs(data, deterministic_missing=not train)
         if train:
             model.optimize_parameters(global_step)
             global_step += 1
@@ -120,7 +153,14 @@ def run_phase(model, data_loader, phase, global_step, writer, global_epoch):
         if model.use_gan:
             totals["loss_recon"] += model.loss_recon_item
             totals["loss_g_gan"] += model.loss_G_GAN_item
+            totals["weighted_loss_recon"] += model.weighted_loss_recon_item
+            totals["weighted_loss_gan"] += model.weighted_loss_gan_item
+            totals["beta_recon"] += model.beta_recon_item
             totals["loss_d"] += model.loss_D_item
+            totals["loss_d_real"] += model.loss_D_real_item
+            totals["loss_d_fake"] += model.loss_D_fake_item
+            totals["d_real_mean"] += model.d_real_mean_item
+            totals["d_fake_mean"] += model.d_fake_mean_item
         totals["psnr_full"] += metrics["psnr_full_sum"]
         totals["psnr_missing"] += metrics["psnr_missing_sum"]
         sample_count += metrics["num_samples"]
@@ -173,8 +213,9 @@ def run_phase(model, data_loader, phase, global_step, writer, global_epoch):
             )
         if train and global_step > 0 and global_step % hparams.checkpoint_interval == 0:
             model.save_checkpoint(global_step, 0, hparams.checkpoint_dir)
-        model.TF_writer(writer, global_step, prefix=phase)
-        _write_train_monitoring(writer, phase, global_step, model, metrics)
+        if train:
+            model.TF_writer(writer, global_step, prefix=phase)
+            _write_train_monitoring(writer, phase, global_step, model, metrics)
         if _should_write_images(train, global_step, batch_count):
             write_mel_images(
                 writer,
@@ -204,13 +245,21 @@ def run_phase(model, data_loader, phase, global_step, writer, global_epoch):
         "ssim_full": None
         if ssim_sample_count == 0
         else totals["ssim_full"] / ssim_sample_count,
+        "blank_frames": float(model.blank_length),
     }
     if model.use_gan:
         averages.update(
             {
                 "loss_recon": totals["loss_recon"] / batch_count,
                 "loss_g_gan": totals["loss_g_gan"] / batch_count,
+                "weighted_loss_recon": totals["weighted_loss_recon"] / batch_count,
+                "weighted_loss_gan": totals["weighted_loss_gan"] / batch_count,
+                "beta_recon": totals["beta_recon"] / batch_count,
                 "loss_d": totals["loss_d"] / batch_count,
+                "loss_d_real": totals["loss_d_real"] / batch_count,
+                "loss_d_fake": totals["loss_d_fake"] / batch_count,
+                "d_real_mean": totals["d_real_mean"] / batch_count,
+                "d_fake_mean": totals["d_fake_mean"] / batch_count,
             }
         )
     ssim_summary = (
@@ -221,7 +270,9 @@ def run_phase(model, data_loader, phase, global_step, writer, global_epoch):
     gan_summary = (
         f" recon={averages['loss_recon']:.6f} "
         f"g_gan={averages['loss_g_gan']:.6f} "
-        f"d={averages['loss_d']:.6f}"
+        f"d={averages['loss_d']:.6f} "
+        f"d_real_mean={averages['d_real_mean']:.4f} "
+        f"d_fake_mean={averages['d_fake_mean']:.4f}"
         if model.use_gan
         else ""
     )
@@ -235,6 +286,8 @@ def run_phase(model, data_loader, phase, global_step, writer, global_epoch):
         f"psnr_missing={averages['psnr_missing']:.3f}"
         f"{ssim_summary}"
     )
+    if not train:
+        _write_phase_averages(writer, phase, global_step, averages, model.current_lr)
     return global_step, stop_training, averages
 
 
@@ -271,6 +324,12 @@ def main():
             "[VIAI-A] PatchGAN disabled (audio-only); "
             "checkpoints will not contain PatchGAN discriminator weights."
         )
+    if hparams.resume and hparams.init_from_viai_a is not None:
+        raise RuntimeError(
+            "Use either --resume/--resume_path to continue a run, or "
+            "--init_from_viai_a to start a new run from pretrained weights; not both."
+        )
+
     os.makedirs(hparams.checkpoint_dir, exist_ok=True)
     data_loaders = viai_a_loader.get_data_loaders(hparams.data_root, phases=("train", "val"))
     model = VIAIAModel(hparams, device=device)
@@ -283,6 +342,15 @@ def main():
             reset_optimizer=hparams.reset_optimizer,
         )
         print(f"[VIAI-A] resumed checkpoint step={global_step} epoch={global_epoch}")
+    elif hparams.init_from_viai_a is not None:
+        source_step, source_epoch = model.load_init_checkpoint(hparams.init_from_viai_a)
+        global_step = 0
+        global_epoch = 0
+        print(
+            "[VIAI-A] initialized from checkpoint "
+            f"source_step={source_step} source_epoch={source_epoch}; "
+            "new run starts at step=0 epoch=0"
+        )
 
     log_event_path = hparams.log_event_path
     if log_event_path is None:

@@ -17,7 +17,8 @@
 | VIAI-A | `train-viai-a` / `test-viai-a` | Audio-only Mel inpainting baseline |
 | VIAI-A + PatchGAN | `train-viai-a --use_gan` | 在 VIAI-A 上加入 Mel PatchGAN |
 | VIAI-AV | `train-viai-av` / `test-viai-av` | 加入 RGB + optical flow 视频分支 |
-| VIAI-AV + sync/probe | `train-viai-av` 默认启用 | 加入 audio-video sync loss 和 VIAI-AA' probe branch |
+| VIAI-AV + sync/probe | `train-viai-av` 默认启用 | 加入 audio-video sync loss 和 VIAI-AA' probe branch，不使用 PatchGAN |
+| VIAI-AV + PatchGAN | `train-viai-av --use_gan` | 在 VIAI-AV 上加入 Mel PatchGAN |
 | Vocoder 输出 | 测试时加 `--use_vocoder` | 使用 Griffin-Lim 将修复 Mel 导出为 wav |
 
 说明：第五阶段使用 Griffin-Lim，不需要训练 WaveNet，也不需要下载 HiFi-GAN/WaveGlow 预训练模型。它适合快速跑通端到端 demo，音质不等价于论文完整 WaveNet 设置。
@@ -200,7 +201,8 @@ python main.py train-viai-a -- \
   --num_workers 4 \
   --checkpoint_interval 1000 \
   --print_freq 100 \
-  --display_id 0
+  --display_id 0 \
+  --log_event_path checkpoints/viai_a_checkpoints 
 ```
 
 测试：
@@ -209,7 +211,7 @@ python main.py train-viai-a -- \
 python main.py test-viai-a -- \
   --data_root "$DATA_ROOT" \
   --test_split_name test_viai_a_split.txt \
-  --resume_path checkpoints/VIAI-A_checkpoint_step000001000.pth.tar \
+  --resume_path checkpoints/VIAI-A_checkpoint_step000006000.pth.tar \
   --batch_size 16 \
   --num_workers 4 \
   --display_id 0 \
@@ -227,25 +229,12 @@ checkpoints/viai_a_test_results/mel-image/stepXXXXXXXXX/*.png
 
 ### 4.2 VIAI-A + PatchGAN
 
-从 VIAI-A checkpoint 热启动：
+从 VIAI-A checkpoint 初始化权重并开启一个新的 PatchGAN 实验。`--init_from_viai_a`
+只加载模型权重，不继承 `global_step`、`global_epoch` 或 optimizer；TensorBoard
+横轴会从 0 开始。若要继续同一个训练 run，才使用 `--resume`。
 
 ```bash
-python main.py train-viai-a -- \
-  --use_gan \
-  --name VIAI-A-PatchGAN \
-  --data_root "$DATA_ROOT" \
-  --train_split_name train_viai_a_split.txt \
-  --val_split_name val_viai_a_split.txt \
-  --resume \
-  --resume_path checkpoints/VIAI-A_checkpoint_step000006800.pth.tar \
-  --reset_optimizer \
-  --batch_size 16 \
-  --num_workers 4 \
-  --beta_recon 1.0 \
-  --checkpoint_interval 1000 \
-  --print_freq 100 \
-  --display_id 0 \
-  --nepochs 120
+python main.py train-viai-a -- \  --use_gan   --name VIAI-A-PatchGAN   --data_root "$DATA_ROOT"   --train_split_name train_viai_a_split.txt   --val_split_name val_viai_a_split.txt     --batch_size 16   --num_workers 4   --beta_recon 1.0   --checkpoint_interval 1000   --print_freq 100   --display_id 0 --lambda_gan 0.001 --log_event_path checkpoints/viai-a_patchfromscratch
 ```
 
 测试 PatchGAN checkpoint 时也传 `--use_gan`：
@@ -256,7 +245,7 @@ python main.py test-viai-a -- \
   --name VIAI-A-PatchGAN \
   --data_root "$DATA_ROOT" \
   --test_split_name test_viai_a_split.txt \
-  --resume_path checkpoints/VIAI-A-PatchGAN_checkpoint_step000002000.pth.tar \
+  --resume_path checkpoints/viai-a_patchfromscratch/VIAI-A-PatchGAN_checkpoint_step000002000.pth.tar \
   --batch_size 16 \
   --num_workers 4 \
   --display_id 0 \
@@ -265,7 +254,8 @@ python main.py test-viai-a -- \
 
 ### 4.3 VIAI-AV
 
-VIAI-AV 默认使用 PatchGAN，并优先从 `VIAI-A-PatchGAN` 初始化音频侧权重。没有 PatchGAN checkpoint 时，会回退到 `VIAI-A` checkpoint。
+VIAI-AV 默认不使用 PatchGAN，用作带视频分支、sync/probe loss 的 baseline，并优先从
+`VIAI-A` checkpoint 初始化音频侧权重。若要启用 PatchGAN，需要显式传 `--use_gan`。
 
 1 step sanity check：
 
@@ -274,7 +264,7 @@ python main.py train-viai-av -- \
   --data_root "$DATA_ROOT" \
   --train_split_name train_av_split.txt \
   --val_split_name val_av_split.txt \
-  --init_from_viai_a checkpoints/VIAI-A-PatchGAN_checkpoint_step000006800.pth.tar \
+  --init_from_viai_a checkpoints/VIAI-A_checkpoint_step000006800.pth.tar \
   --checkpoint_dir /tmp/viai_av_smoke \
   --log_event_path /tmp/viai_av_smoke/events \
   --batch_size 1 \
@@ -291,13 +281,14 @@ python main.py train-viai-av -- \
   --data_root "$DATA_ROOT" \
   --train_split_name train_av_split.txt \
   --val_split_name val_av_split.txt \
-  --init_from_viai_a checkpoints/VIAI-A-PatchGAN_checkpoint_step000006800.pth.tar \
+  --init_from_viai_a checkpoints/VIAI-A_checkpoint_step000006800.pth.tar \
   --batch_size 16 \
   --num_workers 4 \
   --lambda_recon 1.0 \
   --checkpoint_interval 1000 \
   --print_freq 100 \
   --display_id 0
+  --log_event_path checkpoints/viai_av_events
 ```
 
 继续训练：
@@ -312,19 +303,57 @@ python main.py train-viai-av -- \
   --batch_size 16 \
   --num_workers 4 \
   --display_id 0
+  --log_event_path checkpoints/viai_av_events
 ```
 
 测试：
 
 ```bash
 python main.py test-viai-av -- \
-  --resume_path checkpoints/VIAI-AV_checkpoint_step000001000.pth.tar \
+  --resume_path checkpoints/viai_av_checkpoints/VIAI-AV_checkpoint_step000001000.pth.tar \
   --data_root "$DATA_ROOT" \
   --test_split_name test_av_split.txt \
   --batch_size 16 \
   --num_workers 4 \
   --display_id 0 \
   --results_dir checkpoints/viai_av_test_results
+```
+
+### 4.4 VIAI-AV + PatchGAN
+
+启用 PatchGAN 时传 `--use_gan`。默认名称会变为 `VIAI-AV-PatchGAN`，日志目录为
+`events_viai_av_patchgan`；若未显式传 `--init_from_viai_a`，会优先寻找
+`VIAI-A-PatchGAN` checkpoint，找不到再回退到 `VIAI-A` checkpoint。
+
+```bash
+python main.py train-viai-av -- \
+  --use_gan \
+  --data_root "$DATA_ROOT" \
+  --train_split_name train_av_split.txt \
+  --val_split_name val_av_split.txt \
+  --init_from_viai_a checkpoints/VIAI-A-PatchGAN_checkpoint_step000006800.pth.tar \
+  --batch_size 8 \
+  --num_workers 4 \
+  --lambda_recon 1.0 \
+  --lambda_gan 0.001 \
+  --checkpoint_interval 1000 \
+  --print_freq 100 \
+  --display_id 0 \
+  --log_dir checkpoints/viai-av-patchgan_checkpoints \
+```
+
+测试 PatchGAN checkpoint 时也传 `--use_gan`：
+
+```bash
+python main.py test-viai-av -- \
+  --use_gan \
+  --resume_path checkpoints/VIAI-AV-PatchGAN_checkpoint_step000001000.pth.tar \
+  --data_root "$DATA_ROOT" \
+  --test_split_name test_av_split.txt \
+  --batch_size 16 \
+  --num_workers 4 \
+  --display_id 0 \
+  --results_dir checkpoints/viai_av_patchgan_test_results
 ```
 
 如果本地 `test_av_split.txt` 为空，可以临时用训练 split 验证入口：
@@ -349,7 +378,7 @@ checkpoints/viai_av_test_results/VIAI-AV_test_summary.csv
 checkpoints/viai_av_test_results/mel-image/stepXXXXXXXXX/*.png
 ```
 
-### 4.4 Sync/probe ablation
+### 4.5 Sync/probe ablation
 
 第四阶段的 sync loss 和 probe loss 在 `train-viai-av` 中默认启用。需要退回第三阶段式损失时关闭：
 
@@ -363,7 +392,7 @@ python main.py train-viai-av -- \
   --disable_probe_loss
 ```
 
-### 4.5 可选 vocoder 导出 wav
+### 4.6 可选 vocoder 导出 wav
 
 测试时传 `--use_vocoder`，将修复后的 Mel 导出为 wav：
 
@@ -430,6 +459,7 @@ TensorBoard：
 tensorboard --logdir checkpoints/events_viai_a --port 6006
 tensorboard --logdir checkpoints/events_viai_a_patchgan --port 6006
 tensorboard --logdir checkpoints/events_viai_av --port 6006
+tensorboard --logdir checkpoints/events_viai_av_patchgan --port 6006
 ```
 
 VIAI-A/VIAI-AV TensorBoard 额外写入 `weighted_loss_recon` 和
@@ -467,32 +497,7 @@ python -m pip install --no-cache-dir "opencv-contrib-python-headless==4.10.0.84"
 - 先降低 `--batch_size`。
 - smoke test 用 `--batch_size 1 --num_workers 0 --max_train_steps 1`。
 
-## 7. 上传代码到云端
-
-按需修改 SSH 目标地址：
-
-```bash
-rsync -avz --progress \
-  --exclude='.git/' \
-  --exclude='.venv/' \
-  --exclude='data/' \
-  --exclude='checkpoints/' \
-  --exclude='__pycache__/' \
-  --exclude='*.pyc' \
-  --exclude='*.pth.tar' \
-  --exclude='*.Zone.Identifier' \
-  --exclude='.agents/' \
-  --exclude='.codex' \
-  --exclude='.python-version' \
-  --exclude='NUL' \
-  --exclude='uv.lock' \
-  --exclude='VIAI.pdf' \
-  -e "ssh -p 2233 -l 'root@ackcs-00gjgrzt'" \
-  /path/to/Vision-Infused-Audio-Inpainter-VIAI/ \
-  ssh.bj8.bz1.paratera.com:/root/Vision-Infused-Audio-Inpainter-VIAI/
-```
-
-## 8. 代码入口速查
+## 7. 代码入口速查
 
 ```text
 main.py                         # 统一命令入口

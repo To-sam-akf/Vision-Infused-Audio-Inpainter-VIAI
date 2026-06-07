@@ -35,17 +35,19 @@ class VIAIAVModel(object):
     def __init__(self, hparams, device=None):
         self.hparams = hparams
         self.device = device if device is not None else torch.device("cpu")
-        self.use_gan = True
+        self.use_gan = bool(getattr(hparams, "use_gan", False))
         self.enable_sync_loss = not bool(getattr(hparams, "disable_sync_loss", False))
         self.enable_probe_loss = not bool(getattr(hparams, "disable_probe_loss", False))
 
         self.Mel_Encoder = Inpainting_Networks.MelEncoder(hparams=hparams).to(self.device)
         self.VideoEncoder = Image_Embedding.ImageEmbedding(hparams=hparams).to(self.device)
         self.Mel_Decoder = New_Inpainting_Networks.MelDecoderImage(hparams=hparams).to(self.device)
-        self.netD = Discriminator_Networks.MelDiscriminator().to(self.device)
+        self.netD = None
+        if self.use_gan:
+            self.netD = Discriminator_Networks.MelDiscriminator().to(self.device)
 
         self.criterion_l1 = nn.L1Loss()
-        self.criterion_gan = GANLoss(use_lsgan=False, device=self.device)
+        self.criterion_gan = GANLoss(use_lsgan=False, device=self.device) if self.use_gan else None
         self.criterion_sync = L2ContrastiveLoss(
             margin=getattr(hparams, "sync_margin", 1.0),
             max_violation=False,
@@ -61,11 +63,13 @@ class VIAIAVModel(object):
             lr=hparams.lr,
             betas=(hparams.beta1, hparams.beta2),
         )
-        self.optimizer_D = torch.optim.Adam(
-            self.netD.parameters(),
-            lr=hparams.lr,
-            betas=(hparams.beta1, hparams.beta2),
-        )
+        self.optimizer_D = None
+        if self.use_gan:
+            self.optimizer_D = torch.optim.Adam(
+                self.netD.parameters(),
+                lr=hparams.lr,
+                betas=(hparams.beta1, hparams.beta2),
+            )
         self.current_lr = hparams.lr
         self.blank_length = getattr(hparams, "min_blank_frames", 20)
 
@@ -98,6 +102,7 @@ class VIAIAVModel(object):
         lambda_probe = getattr(self.hparams, "lambda_probe", 1.0)
         print(
             "[VIAI-AV] loss weights: "
+            f"use_gan={self.use_gan} "
             f"lambda_gan={lambda_gan} "
             f"lambda_recon={lambda_recon} "
             f"lambda_sync={lambda_sync} "
@@ -105,10 +110,13 @@ class VIAIAVModel(object):
             f"enable_sync_loss={self.enable_sync_loss} "
             f"enable_probe_loss={self.enable_probe_loss}"
         )
-        print(
-            "[VIAI-AV] generator formula: "
-            "loss_av_gen = lambda_gan * loss_g_gan + lambda_recon * loss_recon"
-        )
+        if self.use_gan:
+            print(
+                "[VIAI-AV] generator formula: "
+                "loss_av_gen = lambda_gan * loss_g_gan + lambda_recon * loss_recon"
+            )
+        else:
+            print("[VIAI-AV] generator formula: loss_av_gen = lambda_recon * loss_recon")
         if self.enable_sync_loss or self.enable_probe_loss:
             print(
                 "[VIAI-AV] total formula: "
@@ -217,13 +225,17 @@ class VIAIAVModel(object):
         self.loss_recon, self.loss_full_l1, self.loss_missing_l1 = self._reconstruction_losses(
             self.mel_pred
         )
-
-        pred_fake = self.netD(self.mel_pred)
-        self.loss_G_GAN = self.criterion_gan(pred_fake, True)
-        lambda_gan = getattr(self.hparams, "lambda_gan", 1.0)
         lambda_recon = getattr(self.hparams, "lambda_recon", 1.0)
         self.weighted_loss_recon = lambda_recon * self.loss_recon
-        self.weighted_loss_gan = lambda_gan * self.loss_G_GAN
+
+        if self.use_gan:
+            pred_fake = self.netD(self.mel_pred)
+            self.loss_G_GAN = self.criterion_gan(pred_fake, True)
+            lambda_gan = getattr(self.hparams, "lambda_gan", 1.0)
+            self.weighted_loss_gan = lambda_gan * self.loss_G_GAN
+        else:
+            self.loss_G_GAN = self._zero_loss_like(self.loss_recon)
+            self.weighted_loss_gan = self._zero_loss_like(self.loss_recon)
         self.loss_av_gen = self.weighted_loss_gan + self.weighted_loss_recon
 
         if self.enable_sync_loss:
@@ -237,12 +249,17 @@ class VIAIAVModel(object):
                 self.loss_probe_full_l1,
                 self.loss_probe_missing_l1,
             ) = self._reconstruction_losses(self.mel_probe_pred)
-            pred_probe_fake = self.netD(self.mel_probe_pred)
-            self.loss_probe_G_GAN = self.criterion_gan(pred_probe_fake, True)
-            self.loss_probe_gen = (
-                lambda_gan * self.loss_probe_G_GAN
-                + lambda_recon * self.loss_probe_recon
-            )
+            if self.use_gan:
+                pred_probe_fake = self.netD(self.mel_probe_pred)
+                self.loss_probe_G_GAN = self.criterion_gan(pred_probe_fake, True)
+                lambda_gan = getattr(self.hparams, "lambda_gan", 1.0)
+                self.loss_probe_gen = (
+                    lambda_gan * self.loss_probe_G_GAN
+                    + lambda_recon * self.loss_probe_recon
+                )
+            else:
+                self.loss_probe_G_GAN = self._zero_loss_like(self.loss_probe_recon)
+                self.loss_probe_gen = lambda_recon * self.loss_probe_recon
         else:
             self.loss_probe_recon = self._zero_loss_like(self.loss_av_gen)
             self.loss_probe_full_l1 = self._zero_loss_like(self.loss_av_gen)
@@ -258,8 +275,17 @@ class VIAIAVModel(object):
             + lambda_sync * self.loss_sync
             + lambda_probe * self.weighted_loss_probe_gen
         )
+        if not self.use_gan:
+            self.loss_D_real = self._zero_loss_like(self.loss_av_gen)
+            self.loss_D_fake = self._zero_loss_like(self.loss_av_gen)
+            self.loss_D = self._zero_loss_like(self.loss_av_gen)
 
     def _compute_discriminator_loss(self):
+        if not self.use_gan:
+            self.loss_D_real = self._zero_loss_like(self.loss_av_gen)
+            self.loss_D_fake = self._zero_loss_like(self.loss_av_gen)
+            self.loss_D = self._zero_loss_like(self.loss_av_gen)
+            return
         pred_real = self.netD(self.mel_target_4d)
         fake_losses = [self.criterion_gan(self.netD(self.mel_pred.detach()), False, softlabel=True)]
         if self.enable_probe_loss and self.mel_probe_pred is not None:
@@ -274,7 +300,10 @@ class VIAIAVModel(object):
         self.Mel_Encoder.train()
         self.VideoEncoder.train()
         self.Mel_Decoder.train()
-        self.netD.train()
+        if self.use_gan:
+            self.netD.eval()
+            for parameter in self.netD.parameters():
+                parameter.requires_grad = False
 
         self._forward_inpainter()
         self._compute_losses(global_step)
@@ -282,17 +311,22 @@ class VIAIAVModel(object):
         self.loss_total.backward()
         self.optimizer_G.step()
 
-        self.optimizer_D.zero_grad()
-        self._compute_discriminator_loss()
-        self.loss_D.backward()
-        self.optimizer_D.step()
+        if self.use_gan:
+            self.netD.train()
+            for parameter in self.netD.parameters():
+                parameter.requires_grad = True
+            self.optimizer_D.zero_grad()
+            self._compute_discriminator_loss()
+            self.loss_D.backward()
+            self.optimizer_D.step()
         self.current_lr = self.optimizer_G.param_groups[0]["lr"]
 
     def test(self, global_step=0):
         self.Mel_Encoder.eval()
         self.VideoEncoder.eval()
         self.Mel_Decoder.eval()
-        self.netD.eval()
+        if self.use_gan:
+            self.netD.eval()
         with torch.no_grad():
             self._forward_inpainter()
             self._compute_losses(global_step=global_step)
@@ -361,29 +395,53 @@ class VIAIAVModel(object):
             "Mel_Encoder": self.Mel_Encoder.state_dict(),
             "VideoEncoder": self.VideoEncoder.state_dict(),
             "Mel_Decoder": self.Mel_Decoder.state_dict(),
-            "netD": self.netD.state_dict(),
             "optimizer_G": self.optimizer_G.state_dict()
-            if self.hparams.save_optimizer_state
-            else None,
-            "optimizer_D": self.optimizer_D.state_dict()
             if self.hparams.save_optimizer_state
             else None,
             "global_step": global_step,
             "global_epoch": global_epoch,
-            "use_gan": True,
+            "use_gan": self.use_gan,
             "stage": "VIAI-AV-stage4-sync-probe",
             "enable_sync_loss": self.enable_sync_loss,
             "enable_probe_loss": self.enable_probe_loss,
         }
+        if self.use_gan:
+            checkpoint["netD"] = self.netD.state_dict()
+            checkpoint["optimizer_D"] = (
+                self.optimizer_D.state_dict()
+                if self.hparams.save_optimizer_state
+                else None
+            )
         torch.save(checkpoint, checkpoint_path)
         print("Saved VIAI-AV checkpoint:", checkpoint_path)
         return checkpoint_path
 
+    def _checkpoint_use_gan(self, checkpoint):
+        if "use_gan" in checkpoint:
+            return bool(checkpoint["use_gan"])
+        return "netD" in checkpoint
+
+    def _assert_checkpoint_gan_mode(self, checkpoint, checkpoint_path):
+        checkpoint_use_gan = self._checkpoint_use_gan(checkpoint)
+        if checkpoint_use_gan == self.use_gan:
+            return
+        if checkpoint_use_gan:
+            hint = "This checkpoint includes PatchGAN weights; rerun with --use_gan."
+        else:
+            hint = "This checkpoint was trained without PatchGAN; rerun without --use_gan."
+        raise RuntimeError(
+            "VIAI-AV checkpoint GAN mode mismatch: "
+            f"checkpoint use_gan={checkpoint_use_gan}, current use_gan={self.use_gan}. "
+            f"{hint} checkpoint={checkpoint_path}"
+        )
+    # 导入共有的结构权重，主要是Mel_Encoder和Mel_Decoder的权重，VideoEncoder不导入，因为VIAI-A没有视频编码器；如果有netD且当前模型使用GAN，则导入netD权重，否则不导入netD权重
     def load_checkpoint(self, checkpoint_path, reset_optimizer=False):
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        self._assert_checkpoint_gan_mode(checkpoint, checkpoint_path)
         self.Mel_Encoder.load_state_dict(checkpoint["Mel_Encoder"])
         self.Mel_Decoder.load_state_dict(checkpoint["Mel_Decoder"])
-        self.netD.load_state_dict(checkpoint["netD"])
+        if self.use_gan:
+            self.netD.load_state_dict(checkpoint["netD"])
         if "VideoEncoder" not in checkpoint:
             raise RuntimeError(
                 "This VIAI-AV checkpoint does not contain VideoEncoder. "
@@ -393,7 +451,7 @@ class VIAIAVModel(object):
         if not reset_optimizer:
             if checkpoint.get("optimizer_G") is not None:
                 self.optimizer_G.load_state_dict(checkpoint["optimizer_G"])
-            if checkpoint.get("optimizer_D") is not None:
+            if self.use_gan and checkpoint.get("optimizer_D") is not None:
                 self.optimizer_D.load_state_dict(checkpoint["optimizer_D"])
         return int(checkpoint.get("global_step", 0)), int(checkpoint.get("global_epoch", 0))
 
@@ -411,9 +469,9 @@ class VIAIAVModel(object):
         if hasattr(self.Mel_Decoder, "init_deconv_1_1_1"):
             self.Mel_Decoder.init_deconv_1_1_1()
             print("[VIAI-AV] initialized MelDecoderImage fusion stem from audio decoder stem")
-        if "netD" in checkpoint:
+        if self.use_gan and "netD" in checkpoint:
             _copy_matching_state(self.netD, checkpoint["netD"], "MelDiscriminator")
-        else:
+        elif self.use_gan:
             print(
                 "[VIAI-AV] source checkpoint has no netD; "
                 "MelDiscriminator remains randomly initialized and will be trained by VIAI-AV"

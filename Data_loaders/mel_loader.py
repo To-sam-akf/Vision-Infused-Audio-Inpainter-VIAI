@@ -5,7 +5,7 @@ import torch
 def build_missing_mask(batch_size, mel_bins, mel_steps, start, width, device):
     mask = torch.zeros(batch_size, 1, mel_bins, mel_steps, device=device)
     end = min(start + width, mel_steps)
-    # 生成mask
+    # 生成mask 缺失区域，mask=1 ，mask=0 表示已知区域
     mask[:, :, :, start:end] = 1.0
     return mask
 

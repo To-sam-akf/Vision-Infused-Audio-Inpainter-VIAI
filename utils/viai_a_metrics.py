@@ -12,7 +12,7 @@ def _as_bchw(tensor):
         return tensor
     raise ValueError("Expected a 3D (B, C, T) or 4D (B, 1, C, T) tensor.")
 
-
+# 只替换 missing 区域”的拼接图
 def compose_inpainted_mel(mel_input, mel_pred, missing_mask):
     """Return the final inpainted Mel: keep known bins, replace only the gap."""
     mel_input = _as_bchw(mel_input)
@@ -115,13 +115,21 @@ def _mel_to_uint8_image(mel_2d):
     return (rgb * 255.0).round().astype(np.uint8)
 
 
-def save_mel_comparison_png(path, mel_masked, mel_interpolated, mel_pred, mel_target):
+def save_mel_comparison_png(
+    path,
+    mel_masked,
+    mel_interpolated,
+    mel_raw_pred,
+    mel_completed,
+    mel_target,
+):
     from PIL import Image, ImageDraw
 
     panels = [
         ("masked", _mel_to_uint8_image(mel_masked)),
         ("interpolated", _mel_to_uint8_image(mel_interpolated)),
-        ("prediction", _mel_to_uint8_image(mel_pred)),
+        ("raw_prediction", _mel_to_uint8_image(mel_raw_pred)),
+        ("completed", _mel_to_uint8_image(mel_completed)),
         ("groundtruth", _mel_to_uint8_image(mel_target)),
     ]
     label_height = 18
@@ -161,11 +169,11 @@ def save_mel_comparison_batch(
     mel_target = torch.clamp(_as_bchw(mel_target).detach().cpu(), 0.0, 1.0)
     if missing_mask is None:
         mel_masked = mel_input
-        mel_display_pred = mel_pred
+        mel_completed = mel_pred
     else:
         mask = _as_bchw(missing_mask).detach().cpu().to(dtype=mel_target.dtype)
         mel_masked = torch.clamp(mel_target * (1.0 - mask), 0.0, 1.0)
-        mel_display_pred = torch.clamp(
+        mel_completed = torch.clamp(
             compose_inpainted_mel(mel_input, mel_pred, mask),
             0.0,
             1.0,
@@ -183,7 +191,8 @@ def save_mel_comparison_batch(
             output_path,
             mel_masked[index, 0],
             mel_input[index, 0],
-            mel_display_pred[index, 0],
+            mel_pred[index, 0],
+            mel_completed[index, 0],
             mel_target[index, 0],
         )
         written_paths.append(output_path)

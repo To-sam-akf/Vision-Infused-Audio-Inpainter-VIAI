@@ -84,9 +84,13 @@ def _arg_was_passed(name):
 
 def configure_viai_av_defaults():
     if not _arg_was_passed("--name"):
-        hparams.name = "VIAI-AV"
+        hparams.name = "VIAI-AV-PatchGAN" if getattr(hparams, "use_gan", False) else "VIAI-AV"
     if not _arg_was_passed("--results_dir"):
-        hparams.results_dir = "./checkpoints/viai_av_test_results"
+        hparams.results_dir = (
+            "./checkpoints/viai_av_patchgan_test_results"
+            if getattr(hparams, "use_gan", False)
+            else "./checkpoints/viai_av_test_results"
+        )
 
 
 def checkpoint_step(path):
@@ -307,7 +311,7 @@ def build_result_record(checkpoint_path, checkpoint_step_value, global_step, glo
         "global_epoch": int(global_epoch),
         "test_split_name": hparams.test_split_name,
         "stage": "VIAI-AV-stage4-sync-probe",
-        "use_gan": True,
+        "use_gan": bool(getattr(hparams, "use_gan", False)),
         "enable_sync_loss": not bool(getattr(hparams, "disable_sync_loss", False)),
         "enable_probe_loss": not bool(getattr(hparams, "disable_probe_loss", False)),
         "num_samples": int(results["num_samples"]),

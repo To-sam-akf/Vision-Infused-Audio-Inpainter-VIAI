@@ -28,14 +28,20 @@ def _arg_was_passed(name):
 
 def configure_viai_av_defaults():
     if not _arg_was_passed("--name"):
-        hparams.name = "VIAI-AV"
+        hparams.name = "VIAI-AV-PatchGAN" if getattr(hparams, "use_gan", False) else "VIAI-AV"
     if not _arg_was_passed("--log_event_path"):
-        hparams.log_event_path = os.path.join(hparams.checkpoint_dir, "events_viai_av")
+        event_name = (
+            "events_viai_av_patchgan"
+            if getattr(hparams, "use_gan", False)
+            else "events_viai_av"
+        )
+        hparams.log_event_path = os.path.join(hparams.checkpoint_dir, event_name)
 
 
 def print_viai_av_run_config():
     print(
         "[VIAI-AV] run config: "
+        f"use_gan={getattr(hparams, 'use_gan', False)} "
         f"lambda_recon={getattr(hparams, 'lambda_recon', 1.0)} "
         f"lambda_gan={getattr(hparams, 'lambda_gan', 1.0)} "
         f"lambda_sync={getattr(hparams, 'lambda_sync', 1.0)} "
@@ -82,24 +88,34 @@ def resolve_init_checkpoint():
         return candidate
 
     checkpoint_dir = os.path.abspath(hparams.checkpoint_dir)
-    candidate = resolve_latest_checkpoint(checkpoint_dir, "VIAI-A-PatchGAN_checkpoint_step")
-    if candidate is not None:
-        print(f"[VIAI-AV] using VIAI-A PatchGAN checkpoint for initialization: {candidate}")
-        return candidate
+    if getattr(hparams, "use_gan", False):
+        candidate = resolve_latest_checkpoint(checkpoint_dir, "VIAI-A-PatchGAN_checkpoint_step")
+        if candidate is not None:
+            print(f"[VIAI-AV] using VIAI-A PatchGAN checkpoint for initialization: {candidate}")
+            return candidate
 
-    candidate = resolve_latest_checkpoint(checkpoint_dir, "VIAI-A_checkpoint_step")
-    if candidate is not None:
-        print(
-            "[VIAI-AV] no VIAI-A-PatchGAN checkpoint found; "
-            f"falling back to VIAI-A audio-only checkpoint: {candidate}"
-        )
-        return candidate
+        candidate = resolve_latest_checkpoint(checkpoint_dir, "VIAI-A_checkpoint_step")
+        if candidate is not None:
+            print(
+                "[VIAI-AV] no VIAI-A-PatchGAN checkpoint found; "
+                f"falling back to VIAI-A audio-only checkpoint: {candidate}"
+            )
+            return candidate
+    else:
+        candidate = resolve_latest_checkpoint(checkpoint_dir, "VIAI-A_checkpoint_step")
+        if candidate is not None:
+            print(f"[VIAI-AV] using VIAI-A audio-only checkpoint for baseline initialization: {candidate}")
+            return candidate
 
+    expected = (
+        "VIAI-A-PatchGAN_checkpoint_step*.pth.tar or VIAI-A_checkpoint_step*.pth.tar"
+        if getattr(hparams, "use_gan", False)
+        else "VIAI-A_checkpoint_step*.pth.tar"
+    )
     raise RuntimeError(
         "train-viai-av requires a VIAI-A initialization checkpoint. "
         "Pass --init_from_viai_a explicitly, or place "
-        "VIAI-A-PatchGAN_checkpoint_step*.pth.tar or "
-        "VIAI-A_checkpoint_step*.pth.tar under --checkpoint_dir."
+        f"{expected} under --checkpoint_dir."
     )
 
 

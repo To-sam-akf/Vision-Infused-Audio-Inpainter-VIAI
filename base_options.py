@@ -32,9 +32,11 @@ class BaseOptions(object):
             type=str,
             default=None,
             help=(
-                "For VIAI-AV stage 3, initialize audio-side weights from a "
-                "VIAI-A or VIAI-A-PatchGAN checkpoint. If omitted, train-viai-av "
-                "looks for the latest VIAI-A-PatchGAN checkpoint in checkpoint_dir."
+                "Initialize audio-side weights from a VIAI-A or VIAI-A-PatchGAN "
+                "checkpoint without inheriting step, epoch, or optimizer state. "
+                "For train-viai-av, when omitted it uses the latest VIAI-A "
+                "checkpoint for baseline runs; with --use_gan, it prefers "
+                "VIAI-A-PatchGAN and falls back to VIAI-A."
             ),
         )
         self.parser.add_argument("--load_pretrain", action="store_true")
@@ -116,7 +118,7 @@ class BaseOptions(object):
         self.parser.add_argument(
             "--use_gan",
             action="store_true",
-            help="For VIAI-A stage 2, enable PatchGAN discriminator and GAN loss.",
+            help="Enable PatchGAN discriminator and GAN loss for VIAI-A or VIAI-AV.",
         )
         self.parser.add_argument("--lambda_gan", type=float, default=1.0)
         self.parser.add_argument(
